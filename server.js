@@ -10,7 +10,7 @@ const CONFIG = {
     AZURE_ENDPOINT: process.env.AZURE_ENDPOINT,
     AZURE_API_KEY: process.env.AZURE_API_KEY,
     SERVICE_API_KEY: process.env.SERVICE_API_KEY,
-    PORT: process.env.PORT || 3000,
+    PORT: process.env.PORT || 8080,
     ANTHROPIC_VERSION: "2023-06-01",
     // Default Azure deployment name (can be overridden via AZURE_DEPLOYMENT_NAME)
     AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
