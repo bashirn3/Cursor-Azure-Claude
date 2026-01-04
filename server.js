@@ -40,6 +40,32 @@ function mapModelToDeployment(modelName) {
     return modelName;
 }
 
+// Fix assistant messages before image messages
+function fixImageTurns(messages) {
+  if (!Array.isArray(messages)) return messages;
+
+  const fixed = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    // Check if msg has image content
+    const hasImage =
+      msg.content &&
+      Array.isArray(msg.content) &&
+      msg.content.some(c => c.type === "image_url");
+
+    // If previous message is assistant and current has image, remove previous
+    if (hasImage && i > 0 && fixed[fixed.length - 1].role === "assistant") {
+      fixed.pop();
+    }
+
+    fixed.push(msg);
+  }
+
+  return fixed;
+}
+
+
 // CORS middleware
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
@@ -376,6 +402,10 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
         // Transform request to Anthropic format
         let anthropicRequest;
         try {
+
+             if (req.body.messages) {
+                    req.body.messages = fixImageTurns(req.body.messages);
+                }
             anthropicRequest = transformRequest(req.body);
             console.log("[AZURE] Request transformed successfully");
             console.log("[AZURE] Using model/deployment:", anthropicRequest.model);
