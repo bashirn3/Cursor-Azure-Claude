@@ -428,7 +428,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
                 "x-api-key": CONFIG.AZURE_API_KEY,
                 "anthropic-version": CONFIG.ANTHROPIC_VERSION,
             },
-            timeout: 120000,
+            timeout: 300000,
             responseType: isStreaming ? "stream" : "json",
             validateStatus: function (status) {
                 return status < 600; // Don't throw on any status < 600
@@ -661,7 +661,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
                 "x-api-key": CONFIG.AZURE_API_KEY,
                 "anthropic-version": CONFIG.ANTHROPIC_VERSION,
             },
-            timeout: 120000,
+            timeout: 300000,
             responseType: isStreaming ? "stream" : "json",
         });
 
@@ -809,7 +809,7 @@ app.post("/v1/messages", async (req, res) => {
                 "x-api-key": CONFIG.AZURE_API_KEY,
                 "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
             },
-            timeout: 120000,
+            timeout: 300000,
             responseType: isStreaming ? "stream" : "json",
         });
 
@@ -894,7 +894,7 @@ app.all("/anthropic/*", async (req, res) => {
                 "x-api-key": CONFIG.AZURE_API_KEY,
                 "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
             },
-            timeout: 120000,
+            timeout: 300000,
             responseType: isStreaming ? "stream" : "json",
         });
 
@@ -935,7 +935,7 @@ app.post("/v1/*", async (req, res) => {
                 "x-api-key": CONFIG.AZURE_API_KEY,
                 "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
             },
-            timeout: 120000,
+            timeout: 300000,
             responseType: isStreaming ? "stream" : "json",
         });
 
