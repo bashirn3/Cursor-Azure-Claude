@@ -507,7 +507,11 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
             let buffer = "";
 
             response.data.on("data", (chunk) => {
-                buffer += chunk.toString();
+                const rawChunk = chunk.toString();
+                // DEBUG: Log first 500 chars of each raw chunk
+                console.log("[DEBUG RAW CHUNK]", rawChunk.substring(0, 500));
+                
+                buffer += rawChunk;
                 const lines = buffer.split("\n");
                 buffer = lines.pop();
 
@@ -515,14 +519,24 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
                     if (line.startsWith("data: ")) {
                         const data = line.slice(6).trim();
                         if (data === "[DONE]") {
+                            console.log("[DEBUG] Received [DONE] signal");
                             res.write("data: [DONE]\n\n");
                             continue;
                         }
 
                         try {
                             const anthropicEvent = JSON.parse(data);
+                            // DEBUG: Log every event type and key fields
+                            console.log("[DEBUG EVENT]", {
+                                type: anthropicEvent.type,
+                                index: anthropicEvent.index,
+                                content_block: anthropicEvent.content_block?.type,
+                                delta: anthropicEvent.delta ? Object.keys(anthropicEvent.delta) : null,
+                            });
 
                             if (anthropicEvent.type === "content_block_delta") {
+                                const textContent = anthropicEvent.delta?.text || "";
+                                console.log("[DEBUG] Writing text chunk, length:", textContent.length);
                                 const openaiChunk = {
                                     id: anthropicEvent.id || "chatcmpl-" + Date.now(),
                                     object: "chat.completion.chunk",
@@ -532,7 +546,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
                                         {
                                             index: 0,
                                             delta: {
-                                                content: anthropicEvent.delta?.text || "",
+                                                content: textContent,
                                             },
                                             finish_reason: null,
                                         },
@@ -540,6 +554,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
                                 };
                                 res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
                             } else if (anthropicEvent.type === "message_stop") {
+                                console.log("[DEBUG] Received message_stop, ending stream");
                                 const openaiChunk = {
                                     id: "chatcmpl-" + Date.now(),
                                     object: "chat.completion.chunk",
@@ -555,9 +570,13 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
                                 };
                                 res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
                                 res.write("data: [DONE]\n\n");
+                            } else {
+                                // DEBUG: Log unhandled event types
+                                console.log("[DEBUG UNHANDLED EVENT]", anthropicEvent.type, JSON.stringify(anthropicEvent).substring(0, 300));
                             }
                         } catch (e) {
                             console.error("[ERROR] Failed to parse streaming chunk:", e);
+                            console.error("[ERROR] Raw data that failed:", data.substring(0, 200));
                         }
                     }
                 }
