@@ -776,10 +776,15 @@ function handleGPTStreaming(req, res, response) {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
 
     let buffer = "";
     let currentToolCallIndex = 0;
-    let accumulatedText = "";
+    let didSendDone = false;
+
+    const writeSSE = (payload) => {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
 
     response.data.on("data", (chunk) => {
         buffer += chunk.toString();
@@ -797,10 +802,25 @@ function handleGPTStreaming(req, res, response) {
             try {
                 const event = JSON.parse(data);
 
+                // If upstream already returns OpenAI chat chunks, pass them through untouched.
+                if (event.object === "chat.completion.chunk" && Array.isArray(event.choices)) {
+                    const choice = event.choices[0] || {};
+                    const toolCalls = choice.delta?.tool_calls;
+                    if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+                        console.log("[GPT][STREAM] passthrough tool_calls:", toolCalls.length);
+                    }
+                    if (choice.finish_reason) {
+                        console.log("[GPT][STREAM] passthrough finish_reason:", choice.finish_reason);
+                    }
+                    writeSSE(event);
+                    continue;
+                }
+
                 // Handle Responses API streaming events
                 if (event.type === "response.output_item.added") {
                     // New output item starting
-                    if (event.item?.type === "function_call") {
+                    if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
+                        console.log("[GPT][STREAM] function_call started:", event.item.name || "(unknown)");
                         const toolChunk = {
                             id: "chatcmpl-" + Date.now(),
                             object: "chat.completion.chunk",
@@ -819,7 +839,7 @@ function handleGPTStreaming(req, res, response) {
                                 finish_reason: null,
                             }],
                         };
-                        res.write(`data: ${JSON.stringify(toolChunk)}\n\n`);
+                        writeSSE(toolChunk);
                     }
                 } else if (event.type === "response.output_text.delta" || event.type === "response.text.delta") {
                     // Text delta
@@ -834,9 +854,10 @@ function handleGPTStreaming(req, res, response) {
                             finish_reason: null,
                         }],
                     };
-                    res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
+                    writeSSE(textChunk);
                 } else if (event.type === "response.function_call_arguments.delta") {
                     // Function arguments delta
+                    const argsDelta = event.delta || event.arguments_delta || event.arguments || "";
                     const toolChunk = {
                         id: "chatcmpl-" + Date.now(),
                         object: "chat.completion.chunk",
@@ -847,20 +868,26 @@ function handleGPTStreaming(req, res, response) {
                             delta: {
                                 tool_calls: [{
                                     index: currentToolCallIndex,
-                                    function: { arguments: event.delta || "" }
+                                    function: { arguments: argsDelta }
                                 }]
                             },
                             finish_reason: null,
                         }],
                     };
-                    res.write(`data: ${JSON.stringify(toolChunk)}\n\n`);
+                    writeSSE(toolChunk);
                 } else if (event.type === "response.output_item.done") {
                     // Output item completed
-                    if (event.item?.type === "function_call") {
+                    if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
+                        console.log("[GPT][STREAM] function_call done:", event.item.name || "(unknown)");
                         currentToolCallIndex++;
                     }
                 } else if (event.type === "response.done" || event.type === "response.completed") {
                     // Response completed
+                    const responseOutput = event.response?.output;
+                    if (Array.isArray(responseOutput)) {
+                        const toolCount = responseOutput.filter((item) => item?.type === "function_call" || item?.type === "tool_call").length;
+                        console.log("[GPT][STREAM] response.done output tool_calls:", toolCount);
+                    }
                     const stopChunk = {
                         id: "chatcmpl-" + Date.now(),
                         object: "chat.completion.chunk",
@@ -872,8 +899,9 @@ function handleGPTStreaming(req, res, response) {
                             finish_reason: currentToolCallIndex > 0 ? "tool_calls" : "stop",
                         }],
                     };
-                    res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
+                    writeSSE(stopChunk);
                     res.write("data: [DONE]\n\n");
+                    didSendDone = true;
                 } else if (event.type === "content_block_delta" && event.delta?.text) {
                     // Fallback for standard streaming format
                     const textChunk = {
@@ -887,7 +915,7 @@ function handleGPTStreaming(req, res, response) {
                             finish_reason: null,
                         }],
                     };
-                    res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
+                    writeSSE(textChunk);
                 }
             } catch (e) {
                 console.error("[ERROR] GPT Parse error:", e.message);
@@ -897,6 +925,21 @@ function handleGPTStreaming(req, res, response) {
 
     response.data.on("end", () => {
         console.log("[GPT] Stream ended");
+        if (!didSendDone) {
+            const stopChunk = {
+                id: "chatcmpl-" + Date.now(),
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
+                choices: [{
+                    index: 0,
+                    delta: {},
+                    finish_reason: currentToolCallIndex > 0 ? "tool_calls" : "stop",
+                }],
+            };
+            writeSSE(stopChunk);
+            res.write("data: [DONE]\n\n");
+        }
         res.end();
     });
 
@@ -963,3 +1006,4 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+
