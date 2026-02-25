@@ -246,7 +246,7 @@ function transformClaudeResponse(anthropicResponse) {
 // ============================================================================
 
 function transformRequestForGPT(openAIRequest) {
-    const { messages, model, max_tokens, temperature, stream, tools, tool_choice, ...rest } = openAIRequest;
+    const { messages, input, model, max_tokens, temperature, stream, tools, tool_choice, ...rest } = openAIRequest;
 
     // Convert messages array to Responses API format
     // The Responses API uses "input" which can be a string or array of content items
@@ -301,10 +301,46 @@ function transformRequestForGPT(openAIRequest) {
         }
     }
 
+    // Some clients send an `input` field instead of `messages`.
+    if ((!inputItems.length || !messages) && input !== undefined) {
+        if (typeof input === "string") {
+            inputItems.push({ type: "message", role: "user", content: input });
+        } else if (Array.isArray(input)) {
+            for (const item of input) {
+                if (!item) continue;
+                if (typeof item === "string") {
+                    inputItems.push({ type: "message", role: "user", content: item });
+                    continue;
+                }
+
+                if (item.type === "message" && item.content) {
+                    inputItems.push({
+                        type: "message",
+                        role: item.role || "user",
+                        content: item.content,
+                    });
+                    continue;
+                }
+
+                if (item.role && item.content) {
+                    inputItems.push({
+                        type: "message",
+                        role: item.role,
+                        content: item.content,
+                    });
+                }
+            }
+        }
+    }
+
+    if (inputItems.length === 0) {
+        throw new Error("No usable input/messages for GPT request");
+    }
+
     // Build the Responses API request
     const gptRequest = {
         model: CONFIG.AZURE_OPENAI_MODEL,
-        input: inputItems.length > 0 ? inputItems : "Hello",
+        input: inputItems,
         max_output_tokens: max_tokens || 8192,
     };
 
@@ -927,4 +963,3 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
-
