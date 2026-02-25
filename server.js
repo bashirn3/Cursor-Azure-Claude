@@ -1,4 +1,3 @@
-
 const express = require("express");
 const axios = require("axios");
 const app = express();
@@ -511,9 +510,20 @@ async function handleGPTRequest(req, res) {
 
     const isStreaming = req.body.stream === true;
 
-    const gptRequest = { ...req.body, model: CONFIG.AZURE_OPENAI_MODEL };
+    const validFields = [
+        "messages", "temperature", "top_p", "n", "stream", "stop",
+        "max_tokens", "max_completion_tokens", "presence_penalty",
+        "frequency_penalty", "logit_bias", "user", "tools", "tool_choice",
+        "response_format", "seed", "logprobs", "top_logprobs",
+        "parallel_tool_calls", "stream_options"
+    ];
 
-    console.log("[GPT] Passthrough mode. Model:", gptRequest.model, "Tools:", gptRequest.tools?.length || 0, "Stream:", isStreaming, "tool_choice:", gptRequest.tool_choice || "(none)");
+    const gptRequest = {};
+    for (const key of validFields) {
+        if (req.body[key] !== undefined) gptRequest[key] = req.body[key];
+    }
+
+    console.log("[GPT] Passthrough mode. Model:", CONFIG.AZURE_OPENAI_MODEL, "Tools:", gptRequest.tools?.length || 0, "Stream:", isStreaming, "tool_choice:", gptRequest.tool_choice || "(none)");
 
     const response = await axios.post(CONFIG.AZURE_OPENAI_ENDPOINT, gptRequest, {
         headers: {
@@ -543,6 +553,7 @@ async function handleGPTRequest(req, res) {
                 errorMessage = response.data.error.message;
             }
         }
+        console.error("[GPT] Error from Azure:", errorMessage);
         return res.status(response.status).json({ error: { message: errorMessage, type: "api_error" } });
     }
 
@@ -612,3 +623,4 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+
