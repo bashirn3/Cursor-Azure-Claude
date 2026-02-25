@@ -590,75 +590,21 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
             res.setHeader("Cache-Control", "no-cache");
             res.setHeader("Connection", "keep-alive");
 
-            console.log("[AZURE] Streaming response...");
+            console.log("[AZURE] Streaming response (passthrough)...");
 
-            let buffer = "";
-
-            response.data.on("data", (chunk) => {
-                buffer += chunk.toString();
-                const lines = buffer.split("\n");
-                buffer = lines.pop();
-
-                for (const line of lines) {
-                    if (line.startsWith("data: ")) {
-                        const data = line.slice(6).trim();
-                        if (data === "[DONE]") {
-                            res.write("data: [DONE]\n\n");
-                            continue;
-                        }
-
-                        try {
-                            const anthropicEvent = JSON.parse(data);
-
-                            if (anthropicEvent.type === "content_block_delta") {
-                                const openaiChunk = {
-                                    id: anthropicEvent.id || "chatcmpl-" + Date.now(),
-                                    object: "chat.completion.chunk",
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: req.body.model || "claude-opus-4-5",
-                                    choices: [
-                                        {
-                                            index: 0,
-                                            delta: {
-                                                content: anthropicEvent.delta?.text || "",
-                                            },
-                                            finish_reason: null,
-                                        },
-                                    ],
-                                };
-                                res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
-                            } else if (anthropicEvent.type === "message_stop") {
-                                const openaiChunk = {
-                                    id: "chatcmpl-" + Date.now(),
-                                    object: "chat.completion.chunk",
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: req.body.model || "claude-opus-4-5",
-                                    choices: [
-                                        {
-                                            index: 0,
-                                            delta: {},
-                                            finish_reason: "stop",
-                                        },
-                                    ],
-                                };
-                                res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
-                                res.write("data: [DONE]\n\n");
-                            }
-                        } catch (e) {
-                            console.error("[ERROR] Failed to parse streaming chunk:", e);
-                        }
-                    }
-                }
-            });
+            response.data.pipe(res);
 
             response.data.on("end", () => {
                 console.log("[AZURE] Stream ended");
-                res.end();
             });
 
             response.data.on("error", (error) => {
                 console.error("[ERROR] Stream error:", error);
-                res.end();
+                if (!res.headersSent) {
+                    res.status(500).json({ error: { message: "Stream error: " + error.message, type: "stream_error" } });
+                } else {
+                    res.end();
+                }
             });
         } else {
             console.log("[AZURE] Response received successfully");
