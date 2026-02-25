@@ -337,6 +337,70 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
 
     try {
         if (!CONFIG.AZURE_API_KEY) {
+            return res.status(500).json({ error: { message: "Azure API key not configured", type: "configuration_error" } });
+        }
+
+        const isStreaming = req.body.stream === true;
+        const { stream_options, ...body } = req.body;
+        const requestBody = { ...body, model: CONFIG.AZURE_DEPLOYMENT_NAME };
+
+        const response = await axios.post(CONFIG.AZURE_ENDPOINT, requestBody, {
+            headers: {
+                "Content-Type": "application/json",
+                "x-api-key": CONFIG.AZURE_API_KEY,
+                "anthropic-version": CONFIG.ANTHROPIC_VERSION,
+            },
+            timeout: 300000,
+            responseType: isStreaming ? "stream" : "json",
+            validateStatus: (status) => status < 600,
+        });
+
+        console.log("[AZURE] Response status:", response.status);
+
+        if (response.status >= 400) {
+            let errorMessage = "Azure API error";
+            if (isStreaming && typeof response.data.pipe === "function") {
+                let buf = "";
+                await new Promise((resolve) => {
+                    response.data.on("data", (c) => { buf += c.toString(); });
+                    response.data.on("end", resolve);
+                    response.data.on("error", resolve);
+                });
+                try { errorMessage = JSON.parse(buf)?.error?.message || buf; } catch (e) { errorMessage = buf; }
+            } else if (response.data?.error) {
+                errorMessage = response.data.error.message || errorMessage;
+            }
+            return res.status(response.status).json({ error: { message: errorMessage, type: "api_error" } });
+        }
+
+        if (isStreaming) {
+            res.setHeader("Content-Type", "text/event-stream");
+            res.setHeader("Cache-Control", "no-cache");
+            res.setHeader("Connection", "keep-alive");
+            console.log("[AZURE] Streaming response (passthrough)...");
+            response.data.pipe(res);
+            response.data.on("end", () => console.log("[AZURE] Stream ended"));
+            response.data.on("error", (error) => {
+                console.error("[ERROR] Stream error:", error);
+                if (!res.headersSent) res.status(500).json({ error: { message: error.message, type: "stream_error" } });
+                else res.end();
+            });
+        } else {
+            res.json(response.data);
+        }
+    } catch (error) {
+        console.error("[ERROR] Exception in /chat/completions:", error.message);
+        res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
+    }
+});
+
+// OLD /chat/completions handler (unreachable, kept for reference)
+app.post("/chat/completions_old", requireAuth, async (req, res) => {
+    console.log("[REQUEST /chat/completions_old]", new Date().toISOString());
+    console.log("Model:", req.body?.model, "Stream:", req.body?.stream);
+
+    try {
+        if (!CONFIG.AZURE_API_KEY) {
             console.error("[ERROR] Azure API key not configured");
             return res.status(500).json({
                 error: {
