@@ -318,17 +318,27 @@ function transformRequestForGPT(openAIRequest) {
 
     // Transform tools to Responses API format
     if (tools && Array.isArray(tools) && tools.length > 0) {
-        gptRequest.tools = tools.map(tool => {
-            if (tool.type === "function") {
-                return {
-                    type: "function",
-                    name: tool.function.name,
-                    description: tool.function.description || "",
-                    parameters: tool.function.parameters || { type: "object", properties: {} }
-                };
-            }
-            return tool;
-        });
+        gptRequest.tools = tools
+            .filter(tool => tool && (tool.function?.name || tool.name))
+            .map(tool => {
+                if (tool.type === "function" && tool.function) {
+                    return {
+                        type: "function",
+                        name: tool.function.name,
+                        description: tool.function.description || "",
+                        parameters: tool.function.parameters || { type: "object", properties: {} }
+                    };
+                } else if (tool.name) {
+                    return {
+                        type: "function",
+                        name: tool.name,
+                        description: tool.description || "",
+                        parameters: tool.parameters || tool.input_schema || { type: "object", properties: {} }
+                    };
+                }
+                return null;
+            })
+            .filter(Boolean);
     }
 
     // Handle tool_choice
@@ -676,8 +686,10 @@ async function handleGPTRequest(req, res) {
     try {
         gptRequest = transformRequestForGPT(req.body);
         console.log("[GPT] Model:", gptRequest.model, "Tools:", gptRequest.tools?.length || 0);
+        console.log("[GPT] Input items:", gptRequest.input?.length || 0);
     } catch (transformError) {
         console.error("[ERROR] Transform failed:", transformError.message);
+        console.error("[ERROR] Stack:", transformError.stack);
         return res.status(400).json({ error: { message: "Transform error: " + transformError.message, type: "transform_error" } });
     }
 
