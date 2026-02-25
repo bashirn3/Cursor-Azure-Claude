@@ -392,8 +392,9 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
         const isStreaming = req.body.stream === true;
         console.log(`[AZURE] Streaming mode: ${isStreaming}`);
 
+        const { stream_options, ...bodyWithoutStreamOptions } = req.body;
         const anthropicRequest = {
-            ...req.body,
+            ...bodyWithoutStreamOptions,
             model: CONFIG.AZURE_DEPLOYMENT_NAME,
         };
         console.log("[AZURE] Using model/deployment:", anthropicRequest.model);
