@@ -392,24 +392,11 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
         const isStreaming = req.body.stream === true;
         console.log(`[AZURE] Streaming mode: ${isStreaming}`);
 
-        let anthropicRequest;
-        try {
-            if (req.body.messages) {
-                req.body.messages = fixImageTurns(req.body.messages);
-            }
-            anthropicRequest = transformRequest(req.body);
-            console.log("[AZURE] Request transformed successfully");
-            console.log("[AZURE] Using model/deployment:", anthropicRequest.model);
-            console.log('[AZURE] Transformed request:', JSON.stringify(anthropicRequest, null, 2));
-        } catch (transformError) {
-            console.error("[ERROR] Failed to transform request:", transformError);
-            return res.status(400).json({
-                error: {
-                    message: "Failed to transform request: " + transformError.message,
-                    type: "transform_error",
-                },
-            });
-        }
+        const anthropicRequest = {
+            ...req.body,
+            model: CONFIG.AZURE_DEPLOYMENT_NAME,
+        };
+        console.log("[AZURE] Using model/deployment:", anthropicRequest.model);
 
         console.log("[AZURE] Calling Azure Anthropic API...");
 
