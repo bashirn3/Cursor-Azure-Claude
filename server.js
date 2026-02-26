@@ -796,8 +796,24 @@ async function handleGPTRequest(req, res) {
 
     const isStreaming = req.body.stream === true;
     const endpoint = CONFIG.AZURE_OPENAI_ENDPOINT;
-    const { stream_options, ...cleanBody } = req.body;
+    const {
+        stream_options, messages, max_tokens, n, stop, logprobs,
+        top_logprobs, response_format, seed, logit_bias,
+        ...cleanBody
+    } = req.body;
     const forwardBody = { ...cleanBody, model: CONFIG.AZURE_OPENAI_MODEL };
+    if (max_tokens && !forwardBody.max_output_tokens) {
+        forwardBody.max_output_tokens = max_tokens;
+    }
+
+    console.log("[GPT][REQ-KEYS]", requestId, "body keys:", Object.keys(req.body).join(", "));
+    console.log("[GPT][FWD-KEYS]", requestId, "forward keys:", Object.keys(forwardBody).join(", "));
+    if (Array.isArray(forwardBody.input) && forwardBody.input.length > 0) {
+        const summary = forwardBody.input.slice(0, 5).map((item, i) =>
+            `[${i}] type=${item.type || "?"} role=${item.role || "?"}`
+        ).join(", ");
+        console.log("[GPT][INPUT-PREVIEW]", requestId, summary, "... total:", forwardBody.input.length);
+    }
 
     if (!forwardBody.instructions && Array.isArray(forwardBody.input)) {
         const sysItems = forwardBody.input.filter(
@@ -904,13 +920,17 @@ async function handleGPTRequest(req, res) {
                         console.log("[GPT][EVT]", requestId, etype);
 
                         if (etype === "error" || etype === "response.failed") {
-                            console.error("[GPT][ERROR]", requestId, JSON.stringify(p, null, 2));
+                            const errDetail = p.error?.message
+                                || p.response?.error?.message
+                                || p.response?.status
+                                || "unknown";
+                            console.error("[GPT][ERROR]", requestId, "type:", etype, "detail:", errDetail);
+                            console.error("[GPT][ERROR-FULL]", requestId, JSON.stringify(p).slice(0, 500));
                             if (!roleSent) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
                                 roleSent = true;
                             }
-                            const errMsg = p.error?.message || p.response?.error?.message || JSON.stringify(p);
-                            this.push(`data: ${chatChunk({ content: `\n\n[API Error: ${errMsg}]` })}\n\n`);
+                            this.push(`data: ${chatChunk({ content: `[Azure API ${etype}: ${errDetail}]` })}\n\n`);
                             this.push(`data: ${chatChunk({}, "stop")}\n\n`);
                             this.push("data: [DONE]\n\n");
                             continue;
