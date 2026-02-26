@@ -866,17 +866,84 @@ async function handleGPTRequest(req, res) {
             res.setHeader("Connection", "keep-alive");
             res.setHeader("X-Accel-Buffering", "no");
 
-            let logged = 0;
-            const { PassThrough } = require("stream");
-            const tap = new PassThrough();
-            tap.on("data", (chunk) => {
-                if (logged < 2000) {
-                    const text = chunk.toString();
-                    console.log("[GPT][SSE-TAP]", requestId, text.slice(0, 2000 - logged));
-                    logged += text.length;
-                }
+            const { Transform } = require("stream");
+            let sseBuffer = "";
+            const chatId = `chatcmpl-${requestId}`;
+            const chatCreated = Math.floor(Date.now() / 1000);
+            let toolIdx = 0;
+            const toolMap = {};
+            let hasTools = false;
+            let roleSent = false;
+
+            function chatChunk(delta, finish) {
+                return JSON.stringify({
+                    id: chatId, object: "chat.completion.chunk", created: chatCreated,
+                    model: CONFIG.AZURE_OPENAI_MODEL,
+                    choices: [{ index: 0, delta, finish_reason: finish || null }]
+                });
+            }
+
+            const transformer = new Transform({
+                transform(chunk, enc, cb) {
+                    sseBuffer += chunk.toString();
+                    const parts = sseBuffer.split("\n\n");
+                    sseBuffer = parts.pop();
+
+                    for (const part of parts) {
+                        if (!part.trim()) continue;
+                        let etype = null, edata = null;
+                        for (const line of part.split("\n")) {
+                            if (line.startsWith("event: ")) etype = line.slice(7).trim();
+                            else if (line.startsWith("data: ")) edata = line.slice(6);
+                        }
+                        if (!edata) continue;
+
+                        let p;
+                        try { p = JSON.parse(edata); } catch { continue; }
+
+                        console.log("[GPT][EVT]", requestId, etype);
+
+                        if (etype === "response.created" || etype === "response.in_progress") {
+                            if (!roleSent) {
+                                this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
+                                roleSent = true;
+                            }
+                        } else if (etype === "response.output_text.delta") {
+                            if (!roleSent) {
+                                this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
+                                roleSent = true;
+                            }
+                            this.push(`data: ${chatChunk({ content: p.delta || "" })}\n\n`);
+                        } else if (etype === "response.output_item.added" && p.item?.type === "function_call") {
+                            hasTools = true;
+                            const callId = p.item.call_id || p.item.id;
+                            const idx = toolIdx++;
+                            toolMap[callId] = idx;
+                            if (!roleSent) {
+                                this.push(`data: ${chatChunk({ role: "assistant", content: null })}\n\n`);
+                                roleSent = true;
+                            }
+                            console.log("[GPT][TOOL]", requestId, "index:", idx, "name:", p.item.name, "call_id:", callId);
+                            this.push(`data: ${chatChunk({
+                                tool_calls: [{ index: idx, id: callId, type: "function", function: { name: p.item.name || "", arguments: "" } }]
+                            })}\n\n`);
+                        } else if (etype === "response.function_call_arguments.delta") {
+                            const callId = p.call_id || p.item_id;
+                            const idx = toolMap[callId] ?? 0;
+                            this.push(`data: ${chatChunk({
+                                tool_calls: [{ index: idx, function: { arguments: p.delta || "" } }]
+                            })}\n\n`);
+                        } else if (etype === "response.completed") {
+                            this.push(`data: ${chatChunk({}, hasTools ? "tool_calls" : "stop")}\n\n`);
+                            this.push("data: [DONE]\n\n");
+                        }
+                    }
+                    cb();
+                },
+                flush(cb) { cb(); }
             });
-            response.data.pipe(tap).pipe(res);
+
+            response.data.pipe(transformer).pipe(res);
         } else {
             res.json(response.data);
         }
