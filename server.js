@@ -903,6 +903,19 @@ async function handleGPTRequest(req, res) {
 
                         console.log("[GPT][EVT]", requestId, etype);
 
+                        if (etype === "error" || etype === "response.failed") {
+                            console.error("[GPT][ERROR]", requestId, JSON.stringify(p, null, 2));
+                            if (!roleSent) {
+                                this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
+                                roleSent = true;
+                            }
+                            const errMsg = p.error?.message || p.response?.error?.message || JSON.stringify(p);
+                            this.push(`data: ${chatChunk({ content: `\n\n[API Error: ${errMsg}]` })}\n\n`);
+                            this.push(`data: ${chatChunk({}, "stop")}\n\n`);
+                            this.push("data: [DONE]\n\n");
+                            continue;
+                        }
+
                         if (etype === "response.created" || etype === "response.in_progress") {
                             if (!roleSent) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
