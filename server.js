@@ -411,44 +411,46 @@ function writeSSEFromChatCompletion(req, res, openAIResponse) {
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
 
-    const chunk = {
-        id: openAIResponse.id || "chatcmpl-" + Date.now(),
-        object: "chat.completion.chunk",
-        created: openAIResponse.created || Math.floor(Date.now() / 1000),
-        model: openAIResponse.model || req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-        choices: [{
-            index: 0,
-            delta: {},
-            finish_reason: null,
-        }],
-    };
-
+    const id = openAIResponse.id || "chatcmpl-" + Date.now();
+    const created = openAIResponse.created || Math.floor(Date.now() / 1000);
+    const model = openAIResponse.model || req.body.model || CONFIG.AZURE_OPENAI_MODEL;
     const message = openAIResponse.choices?.[0]?.message || {};
     const finishReason = openAIResponse.choices?.[0]?.finish_reason || "stop";
-    const content = message.content || "";
-    if (content) {
-        chunk.choices[0].delta.content = content;
-    }
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-        chunk.choices[0].delta.tool_calls = message.tool_calls.map((tc, idx) => ({
+    const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+
+    const makeChunk = (delta, finish) => JSON.stringify({
+        id, object: "chat.completion.chunk", created, model,
+        choices: [{ index: 0, delta, logprobs: null, finish_reason: finish }],
+    });
+
+    if (hasToolCalls) {
+        // Chunk 1: role + tool call headers (name, id, type) with empty arguments
+        const toolHeaders = message.tool_calls.map((tc, idx) => ({
             index: idx,
             id: tc.id,
             type: "function",
-            function: {
-                name: tc.function?.name || "",
-                arguments: tc.function?.arguments || "{}"
-            }
+            function: { name: tc.function?.name || "", arguments: "" }
         }));
+        res.write(`data: ${makeChunk({ role: "assistant", content: null, tool_calls: toolHeaders }, null)}\n\n`);
+
+        // Chunk 2+: argument content for each tool call
+        for (let idx = 0; idx < message.tool_calls.length; idx++) {
+            const args = message.tool_calls[idx].function?.arguments || "{}";
+            res.write(`data: ${makeChunk({ tool_calls: [{ index: idx, function: { arguments: args } }] }, null)}\n\n`);
+        }
+
+        // Final chunk: finish_reason = "tool_calls"
+        res.write(`data: ${makeChunk({}, "tool_calls")}\n\n`);
+
+        console.log("[GPT][SSE] Emitted", message.tool_calls.length, "tool call(s) via buffered SSE:",
+            message.tool_calls.map(tc => tc.function?.name).join(", "));
+    } else {
+        // Text-only response
+        const content = message.content || "";
+        res.write(`data: ${makeChunk({ role: "assistant", content }, null)}\n\n`);
+        res.write(`data: ${makeChunk({}, finishReason)}\n\n`);
     }
 
-    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    res.write(`data: ${JSON.stringify({
-        id: openAIResponse.id || "chatcmpl-" + Date.now(),
-        object: "chat.completion.chunk",
-        created: openAIResponse.created || Math.floor(Date.now() / 1000),
-        model: openAIResponse.model || req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-        choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
-    })}\n\n`);
     res.write("data: [DONE]\n\n");
     res.end();
 }
