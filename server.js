@@ -799,9 +799,26 @@ async function handleGPTRequest(req, res) {
     const { stream_options, ...cleanBody } = req.body;
     const forwardBody = { ...cleanBody, model: CONFIG.AZURE_OPENAI_MODEL };
 
-    const toolCount = Array.isArray(req.body.tools) ? req.body.tools.length : 0;
-    const inputCount = Array.isArray(req.body.input) ? req.body.input.length : 0;
-    const msgCount = Array.isArray(req.body.messages) ? req.body.messages.length : 0;
+    if (!forwardBody.instructions && Array.isArray(forwardBody.input)) {
+        const sysItems = forwardBody.input.filter(
+            item => item.role === "system" || item.role === "developer"
+        );
+        if (sysItems.length > 0) {
+            forwardBody.instructions = sysItems.map(item => {
+                if (typeof item.content === "string") return item.content;
+                if (Array.isArray(item.content)) return item.content.map(c => c.text || "").join("\n");
+                return "";
+            }).join("\n\n");
+            forwardBody.input = forwardBody.input.filter(
+                item => item.role !== "system" && item.role !== "developer"
+            );
+            console.log("[GPT][FIX]", requestId, "Moved system prompt to instructions, length:", forwardBody.instructions.length);
+        }
+    }
+
+    const toolCount = Array.isArray(forwardBody.tools) ? forwardBody.tools.length : 0;
+    const inputCount = Array.isArray(forwardBody.input) ? forwardBody.input.length : 0;
+    const msgCount = Array.isArray(forwardBody.messages) ? forwardBody.messages.length : 0;
     console.log("[GPT][PIPE]", requestId,
         "Endpoint:", endpoint,
         "Model:", CONFIG.AZURE_OPENAI_MODEL,
