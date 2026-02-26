@@ -784,18 +784,6 @@ function handleClaudeStreaming(req, res, response) {
     });
 }
 
-function getGPTChatEndpoint() {
-    const endpoint = CONFIG.AZURE_OPENAI_ENDPOINT || "";
-    // Extract base URL (everything before /openai/...)
-    const match = endpoint.match(/^(https?:\/\/[^/]+)/);
-    if (!match) return endpoint.replace(/\/openai\/responses/, "/openai/chat/completions");
-    const baseUrl = match[1];
-    // Extract api-version from query string
-    const versionMatch = endpoint.match(/api-version=([^&]+)/);
-    const apiVersion = versionMatch ? versionMatch[1] : "2025-04-01-preview";
-    return `${baseUrl}/openai/deployments/${CONFIG.AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${apiVersion}`;
-}
-
 async function handleGPTRequest(req, res) {
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -807,30 +795,22 @@ async function handleGPTRequest(req, res) {
     }
 
     const isStreaming = req.body.stream === true;
-    const chatEndpoint = getGPTChatEndpoint();
-
-    // Pass-through: forward the Chat Completions request to Azure as-is.
-    // Only override the model name to match the Azure deployment.
+    const endpoint = CONFIG.AZURE_OPENAI_ENDPOINT;
     const forwardBody = { ...req.body, model: CONFIG.AZURE_OPENAI_MODEL };
 
     const toolCount = Array.isArray(req.body.tools) ? req.body.tools.length : 0;
+    const inputCount = Array.isArray(req.body.input) ? req.body.input.length : 0;
     const msgCount = Array.isArray(req.body.messages) ? req.body.messages.length : 0;
-    const bodyKeys = Object.keys(req.body).join(", ");
-    console.log("[GPT][PASSTHROUGH]", requestId,
-        "Endpoint:", chatEndpoint,
+    console.log("[GPT][PIPE]", requestId,
+        "Endpoint:", endpoint,
         "Model:", CONFIG.AZURE_OPENAI_MODEL,
-        "Messages:", msgCount,
+        "Input:", inputCount, "Messages:", msgCount,
         "Tools:", toolCount,
         "Stream:", isStreaming,
-        "tool_choice:", req.body.tool_choice || "(none)",
-        "body_keys:", bodyKeys);
-    if (msgCount > 0) {
-        const first = req.body.messages[0];
-        console.log("[GPT][PASSTHROUGH] First message role:", first?.role, "content_type:", typeof first?.content);
-    }
+        "tool_choice:", req.body.tool_choice || "(none)");
 
     try {
-        const response = await axios.post(chatEndpoint, forwardBody, {
+        const response = await axios.post(endpoint, forwardBody, {
             headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
@@ -841,7 +821,7 @@ async function handleGPTRequest(req, res) {
             validateStatus: (status) => status < 600,
         });
 
-        console.log("[GPT][PASSTHROUGH]", requestId, "Response status:", response.status);
+        console.log("[GPT][PIPE]", requestId, "Response status:", response.status);
 
         if (response.status >= 400) {
             let errorMessage = "GPT API error";
@@ -858,7 +838,7 @@ async function handleGPTRequest(req, res) {
                     errorMessage = typeof response.data.error === "string" ? response.data.error : response.data.error.message;
                 }
             }
-            console.error("[GPT][PASSTHROUGH] Error:", errorMessage);
+            console.error("[GPT][PIPE] Error:", errorMessage);
             return res.status(response.status).json({ error: { message: errorMessage, type: "api_error" } });
         }
 
@@ -869,13 +849,10 @@ async function handleGPTRequest(req, res) {
             res.setHeader("X-Accel-Buffering", "no");
             response.data.pipe(res);
         } else {
-            const toolCallCount = response.data?.choices?.[0]?.message?.tool_calls?.length || 0;
-            console.log("[GPT][PASSTHROUGH]", requestId, "tool_calls:", toolCallCount,
-                "finish_reason:", response.data?.choices?.[0]?.finish_reason);
             res.json(response.data);
         }
     } catch (error) {
-        console.error("[GPT][PASSTHROUGH] Error:", error.message);
+        console.error("[GPT][PIPE] Error:", error.message);
         if (error.response) {
             return res.status(error.response.status).json(error.response.data || { error: { message: error.message, type: "api_error" } });
         }
@@ -925,16 +902,17 @@ app.use((req, res) => {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
-    console.log("Azure Multi-Model Proxy v5.0 - Claude + GPT (Chat Completions Pass-through)");
+    console.log("Azure Multi-Model Proxy v5.1 - Claude + GPT (Direct Pipe)");
     console.log("=".repeat(60));
     console.log(`Server: 0.0.0.0:${CONFIG.PORT}`);
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
     console.log(`GPT: ${CONFIG.AZURE_OPENAI_API_KEY ? "Configured" : "MISSING"}`);
-    console.log(`GPT Chat Endpoint: ${getGPTChatEndpoint()}`);
+    console.log(`GPT Endpoint: ${CONFIG.AZURE_OPENAI_ENDPOINT}`);
     console.log(`Endpoints: /chat/completions, /v1/chat/completions, /v1/messages`);
     console.log("=".repeat(60));
 });
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+
 
