@@ -769,7 +769,6 @@ function handleClaudeStreaming(req, res, response) {
 
 async function handleGPTRequest(req, res) {
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    res.setHeader("x-proxy-request-id", requestId);
 
     if (!CONFIG.AZURE_OPENAI_API_KEY) {
         return res.status(500).json({ error: { message: "GPT API key not configured (AZURE_OPENAI_API_KEY)", type: "configuration_error" } });
@@ -778,58 +777,56 @@ async function handleGPTRequest(req, res) {
         return res.status(500).json({ error: { message: "GPT endpoint not configured (AZURE_OPENAI_ENDPOINT)", type: "configuration_error" } });
     }
 
-    const clientRequestedStreaming = req.body.stream === true;
-    const hasToolsInRequest = Array.isArray(req.body.tools) && req.body.tools.length > 0;
-    const shouldBufferToolRequests = hasToolsInRequest && !CONFIG.GPT_STREAM_TOOLS;
-    const diagnostics = {
-        request_id: requestId,
-        client_stream: clientRequestedStreaming,
-        has_tools: hasToolsInRequest,
-        buffered_tools: shouldBufferToolRequests,
-        initial_tool_choice: null,
-        initial_tool_calls: null,
-        retried_required: false,
-        retry_tool_calls: null,
-    };
+    const isStreaming = req.body.stream === true;
 
     let gptRequest;
     try {
         gptRequest = transformRequestForGPT(req.body);
-        if (shouldBufferToolRequests && clientRequestedStreaming) {
-            // Tool requests are handled as non-stream upstream for deterministic tool args.
-            gptRequest.stream = false;
+        console.log("[GPT]", requestId, "Model:", gptRequest.model,
+            "Tools:", gptRequest.tools?.length || 0,
+            "tool_choice:", gptRequest.tool_choice || "(none)",
+            "Input items:", gptRequest.input?.length || 0,
+            "Stream:", isStreaming);
+
+        // Dump first 3 input items and instructions snippet for debugging
+        if (gptRequest.input) {
+            const preview = gptRequest.input.slice(0, 3).map((item, i) => {
+                const content = typeof item.content === "string"
+                    ? item.content.substring(0, 120)
+                    : "(non-string)";
+                return `  [${i}] type=${item.type} role=${item.role || "-"} content=${content}...`;
+            });
+            console.log("[GPT][DEBUG] Input preview:\n" + preview.join("\n"));
         }
-        diagnostics.initial_tool_choice = gptRequest.tool_choice || "auto";
-        console.log("[GPT] Model:", gptRequest.model, "Tools:", gptRequest.tools?.length || 0, "tool_choice:", gptRequest.tool_choice || "(none)");
-        console.log("[GPT] Request:", requestId, "Input items:", gptRequest.input?.length || 0, "Stream:", clientRequestedStreaming, "BufferedTools:", shouldBufferToolRequests);
+        if (gptRequest.instructions) {
+            console.log("[GPT][DEBUG] Instructions length:", gptRequest.instructions.length,
+                "preview:", gptRequest.instructions.substring(0, 200) + "...");
+        }
+        if (gptRequest.tools && gptRequest.tools.length > 0) {
+            const toolNames = gptRequest.tools.map(t => t.name).join(", ");
+            console.log("[GPT][DEBUG] Tool names:", toolNames);
+        }
     } catch (transformError) {
         console.error("[ERROR] Transform failed:", transformError.message);
         return res.status(400).json({ error: { message: "Transform error: " + transformError.message, type: "transform_error" } });
     }
 
-    const requiresToolCalls = gptRequest.tool_choice === "required";
-    const responseType = gptRequest.stream === true ? "stream" : "json";
+    const response = await axios.post(CONFIG.AZURE_OPENAI_ENDPOINT, gptRequest, {
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
+        },
+        timeout: 300000,
+        responseType: isStreaming ? "stream" : "json",
+        validateStatus: (status) => status < 600,
+    });
 
-    const sendGPTRequest = async (payload, asResponseType) => {
-        return axios.post(CONFIG.AZURE_OPENAI_ENDPOINT, payload, {
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
-            },
-            timeout: 300000,
-            responseType: asResponseType,
-            validateStatus: (status) => status < 600,
-        });
-    };
-
-    const response = await sendGPTRequest(gptRequest, responseType);
-
-    console.log("[GPT] Response status:", response.status);
+    console.log("[GPT]", requestId, "Response status:", response.status);
 
     if (response.status >= 400) {
         let errorMessage = "GPT API error";
         if (response.data) {
-            if (responseType === "stream" && typeof response.data.pipe === "function") {
+            if (isStreaming && typeof response.data.pipe === "function") {
                 let errorBuffer = "";
                 await new Promise((resolve) => {
                     response.data.on("data", (chunk) => { errorBuffer += chunk.toString(); });
@@ -845,64 +842,18 @@ async function handleGPTRequest(req, res) {
         return res.status(response.status).json({ error: { message: errorMessage, type: "api_error" } });
     }
 
-    if (responseType === "stream") {
-        return handleGPTStreaming(req, res, response, requiresToolCalls);
+    if (isStreaming) {
+        return handleGPTStreaming(req, res, response);
     }
 
     try {
-        let openAIResponse = transformGPTResponse(response.data);
-        let toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
-        diagnostics.initial_tool_calls = toolCallCount;
-        console.log("[GPT] tool_calls in response:", toolCallCount);
-
-        // If tools were available but auto produced none, retry once with required.
-        if (hasToolsInRequest && !requiresToolCalls && toolCallCount === 0) {
-            console.warn("[GPT] Auto mode returned zero tool calls; retrying with tool_choice=required");
-            diagnostics.retried_required = true;
-            const retryPayload = {
-                ...gptRequest,
-                tool_choice: "required",
-                stream: false,
-            };
-            const retryResponse = await sendGPTRequest(retryPayload, "json");
-            console.log("[GPT] Retry response status:", retryResponse.status);
-
-            if (retryResponse.status >= 400) {
-                const retryError = retryResponse.data?.error?.message || "GPT API retry error";
-                return res.status(retryResponse.status).json({
-                    error: { message: retryError, type: "api_error" }
-                });
-            }
-
-            openAIResponse = transformGPTResponse(retryResponse.data);
-            toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
-            diagnostics.retry_tool_calls = toolCallCount;
-            console.log("[GPT] tool_calls after required retry:", toolCallCount);
-        }
-
-        if (requiresToolCalls && toolCallCount === 0) {
-            console.warn("[GPT] WARNING: tool_choice=required but response had zero tool_calls");
-            return res.status(502).json({
-                error: {
-                    message: "tool_choice=required but model returned no tool calls",
-                    type: "tool_protocol_error",
-                    details: diagnostics
-                }
-            });
-        }
-        if (CONFIG.STRICT_TOOL_PROTOCOL && hasToolsInRequest && toolCallCount === 0) {
-            console.error("[GPT] Tool protocol violation:", JSON.stringify(diagnostics));
-            return res.status(502).json({
-                error: {
-                    message: "Tools were provided, but model returned no tool calls after retry",
-                    type: "tool_protocol_error",
-                    details: diagnostics
-                }
-            });
-        }
-
-        if (clientRequestedStreaming && shouldBufferToolRequests) {
-            return writeSSEFromChatCompletion(req, res, openAIResponse);
+        const openAIResponse = transformGPTResponse(response.data);
+        const toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
+        console.log("[GPT]", requestId, "tool_calls:", toolCallCount,
+            "finish_reason:", openAIResponse.choices?.[0]?.finish_reason);
+        if (toolCallCount > 0) {
+            const names = openAIResponse.choices[0].message.tool_calls.map(tc => tc.function?.name);
+            console.log("[GPT]", requestId, "tool names:", names.join(", "));
         }
         return res.json(openAIResponse);
     } catch (transformError) {
@@ -911,7 +862,7 @@ async function handleGPTRequest(req, res) {
     }
 }
 
-function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
+function handleGPTStreaming(req, res, response) {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -920,6 +871,8 @@ function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
     let buffer = "";
     let currentToolCallIndex = 0;
     let didSendDone = false;
+    let sentFirstDelta = false;
+    const toolCallArgs = {};
 
     const writeSSE = (payload) => {
         res.write(`data: ${JSON.stringify(payload)}\n\n`);
@@ -952,7 +905,24 @@ function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
 
                 if (event.type === "response.output_item.added") {
                     if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
-                        console.log("[GPT][STREAM] function_call started:", event.item.name || "(unknown)", "call_id:", event.item.call_id || event.item.id);
+                        const callId = event.item.call_id || event.item.id;
+                        const name = event.item.name || "";
+                        console.log("[GPT][STREAM] function_call started:", name, "call_id:", callId);
+                        toolCallArgs[currentToolCallIndex] = "";
+
+                        const delta = {
+                            tool_calls: [{
+                                index: currentToolCallIndex,
+                                id: callId,
+                                type: "function",
+                                function: { name, arguments: "" }
+                            }]
+                        };
+                        if (!sentFirstDelta) {
+                            delta.role = "assistant";
+                            delta.content = null;
+                            sentFirstDelta = true;
+                        }
                         writeSSE({
                             id: "chatcmpl-" + Date.now(),
                             object: "chat.completion.chunk",
@@ -960,19 +930,40 @@ function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
                             model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
                             choices: [{
                                 index: 0,
-                                delta: {
-                                    tool_calls: [{
-                                        index: currentToolCallIndex,
-                                        id: event.item.call_id || event.item.id,
-                                        type: "function",
-                                        function: { name: event.item.name || "", arguments: "" }
-                                    }]
-                                },
+                                delta,
+                                logprobs: null,
                                 finish_reason: null,
                             }],
                         });
+                    } else if (event.item?.type === "message") {
+                        if (!sentFirstDelta) {
+                            writeSSE({
+                                id: "chatcmpl-" + Date.now(),
+                                object: "chat.completion.chunk",
+                                created: Math.floor(Date.now() / 1000),
+                                model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
+                                choices: [{
+                                    index: 0,
+                                    delta: { role: "assistant", content: "" },
+                                    logprobs: null,
+                                    finish_reason: null,
+                                }],
+                            });
+                            sentFirstDelta = true;
+                        }
                     }
                 } else if (event.type === "response.output_text.delta" || event.type === "response.text.delta") {
+                    const textDelta = event.delta || "";
+                    if (!sentFirstDelta) {
+                        writeSSE({
+                            id: "chatcmpl-" + Date.now(),
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
+                            choices: [{ index: 0, delta: { role: "assistant", content: "" }, logprobs: null, finish_reason: null }],
+                        });
+                        sentFirstDelta = true;
+                    }
                     writeSSE({
                         id: "chatcmpl-" + Date.now(),
                         object: "chat.completion.chunk",
@@ -980,12 +971,16 @@ function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
                         model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
                         choices: [{
                             index: 0,
-                            delta: { content: event.delta || "" },
+                            delta: { content: textDelta },
+                            logprobs: null,
                             finish_reason: null,
                         }],
                     });
                 } else if (event.type === "response.function_call_arguments.delta") {
                     const argsDelta = event.delta || event.arguments_delta || "";
+                    if (toolCallArgs[currentToolCallIndex] !== undefined) {
+                        toolCallArgs[currentToolCallIndex] += argsDelta;
+                    }
                     writeSSE({
                         id: "chatcmpl-" + Date.now(),
                         object: "chat.completion.chunk",
@@ -999,12 +994,17 @@ function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
                                     function: { arguments: argsDelta }
                                 }]
                             },
+                            logprobs: null,
                             finish_reason: null,
                         }],
                     });
                 } else if (event.type === "response.output_item.done") {
                     if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
-                        console.log("[GPT][STREAM] function_call done:", event.item.name || "(unknown)");
+                        const name = event.item.name || "(unknown)";
+                        const args = toolCallArgs[currentToolCallIndex] || "";
+                        console.log("[GPT][STREAM] function_call done:", name,
+                            "args_length:", args.length,
+                            "args_preview:", args.substring(0, 200));
                         currentToolCallIndex++;
                     }
                 } else if (event.type === "response.done" || event.type === "response.completed") {
@@ -1012,9 +1012,6 @@ function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
                     if (Array.isArray(responseOutput)) {
                         const toolCount = responseOutput.filter(i => i?.type === "function_call").length;
                         console.log("[GPT][STREAM] response.done — tool_calls:", toolCount, "total_output_items:", responseOutput.length);
-                        if (requiresToolCalls && toolCount === 0) {
-                            console.warn("[GPT][STREAM] WARNING: tool_choice=required but stream completed without tool calls");
-                        }
                     }
                     writeSSE({
                         id: "chatcmpl-" + Date.now(),
@@ -1024,6 +1021,7 @@ function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
                         choices: [{
                             index: 0,
                             delta: {},
+                            logprobs: null,
                             finish_reason: currentToolCallIndex > 0 ? "tool_calls" : "stop",
                         }],
                     });
