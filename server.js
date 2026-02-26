@@ -324,24 +324,39 @@ function transformRequestForGPT(openAIRequest) {
                     inputItems.push({ type: "message", role: "user", content: item });
                     continue;
                 }
-                if (item.type === "message" && item.content) {
-                    inputItems.push({
-                        type: "message",
-                        role: item.role || "user",
-                        content: typeof item.content === "string" ? item.content : textFromParts(item.content)
-                    });
+                const itemRole = item.role || "";
+                const itemContent = typeof item.content === "string"
+                    ? item.content
+                    : textFromParts(item.content);
+
+                if (itemRole === "system" || itemRole === "developer") {
+                    if (itemContent) {
+                        systemPrompt = systemPrompt ? systemPrompt + "\n" + itemContent : itemContent;
+                    }
                     continue;
                 }
-                if (item.role && item.content) {
+                if ((item.type === "message" || item.role) && itemContent) {
                     inputItems.push({
                         type: "message",
-                        role: item.role,
-                        content: typeof item.content === "string" ? item.content : textFromParts(item.content)
+                        role: itemRole === "assistant" ? "assistant" : "user",
+                        content: itemContent
                     });
                 }
             }
         }
     }
+
+    // Safety: strip any system/developer items that leaked into input
+    inputItems = inputItems.filter(item => {
+        if (item.type === "message" && (item.role === "system" || item.role === "developer")) {
+            const text = typeof item.content === "string" ? item.content : textFromParts(item.content);
+            if (text) {
+                systemPrompt = systemPrompt ? systemPrompt + "\n" + text : text;
+            }
+            return false;
+        }
+        return true;
+    });
 
     if (inputItems.length === 0) {
         throw new Error("No usable input/messages for GPT request");
@@ -355,6 +370,9 @@ function transformRequestForGPT(openAIRequest) {
 
     if (systemPrompt) {
         gptRequest.instructions = systemPrompt;
+        console.log("[GPT][TRANSFORM] System prompt extracted to instructions, length:", systemPrompt.length);
+    } else {
+        console.warn("[GPT][TRANSFORM] WARNING: No system prompt found — model may not use tools");
     }
 
     if (temperature !== undefined) gptRequest.temperature = temperature;
@@ -1128,4 +1146,3 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
-
