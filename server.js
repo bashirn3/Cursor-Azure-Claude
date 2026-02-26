@@ -357,7 +357,7 @@ function transformRequestForGPT(openAIRequest) {
             .filter(Boolean);
 
         if (!tool_choice) {
-            gptRequest.tool_choice = "auto";
+            gptRequest.tool_choice = "required";
         }
     }
 
@@ -708,6 +708,8 @@ async function handleGPTRequest(req, res) {
         return res.status(400).json({ error: { message: "Transform error: " + transformError.message, type: "transform_error" } });
     }
 
+    const requiresToolCalls = gptRequest.tool_choice === "required";
+
     const response = await axios.post(CONFIG.AZURE_OPENAI_ENDPOINT, gptRequest, {
         headers: {
             "Content-Type": "application/json",
@@ -740,11 +742,15 @@ async function handleGPTRequest(req, res) {
     }
 
     if (isStreaming) {
-        handleGPTStreaming(req, res, response);
+        handleGPTStreaming(req, res, response, requiresToolCalls);
     } else {
         try {
             const openAIResponse = transformGPTResponse(response.data);
-            console.log("[GPT] tool_calls in response:", openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0);
+            const toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
+            console.log("[GPT] tool_calls in response:", toolCallCount);
+            if (requiresToolCalls && toolCallCount === 0) {
+                console.warn("[GPT] WARNING: tool_choice=required but response had zero tool_calls");
+            }
             res.json(openAIResponse);
         } catch (transformError) {
             console.error("[ERROR] Response transform failed:", transformError.message);
@@ -753,7 +759,7 @@ async function handleGPTRequest(req, res) {
     }
 }
 
-function handleGPTStreaming(req, res, response) {
+function handleGPTStreaming(req, res, response, requiresToolCalls = false) {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -854,6 +860,9 @@ function handleGPTStreaming(req, res, response) {
                     if (Array.isArray(responseOutput)) {
                         const toolCount = responseOutput.filter(i => i?.type === "function_call").length;
                         console.log("[GPT][STREAM] response.done — tool_calls:", toolCount, "total_output_items:", responseOutput.length);
+                        if (requiresToolCalls && toolCount === 0) {
+                            console.warn("[GPT][STREAM] WARNING: tool_choice=required but stream completed without tool calls");
+                        }
                     }
                     writeSSE({
                         id: "chatcmpl-" + Date.now(),
@@ -969,3 +978,4 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+
