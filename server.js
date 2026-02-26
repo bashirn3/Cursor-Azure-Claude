@@ -793,15 +793,19 @@ async function handleGPTRequest(req, res) {
     const requiresToolCalls = gptRequest.tool_choice === "required";
     const responseType = gptRequest.stream === true ? "stream" : "json";
 
-    const response = await axios.post(CONFIG.AZURE_OPENAI_ENDPOINT, gptRequest, {
-        headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
-        },
-        timeout: 300000,
-        responseType,
-        validateStatus: (status) => status < 600,
-    });
+    const sendGPTRequest = async (payload, asResponseType) => {
+        return axios.post(CONFIG.AZURE_OPENAI_ENDPOINT, payload, {
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
+            },
+            timeout: 300000,
+            responseType: asResponseType,
+            validateStatus: (status) => status < 600,
+        });
+    };
+
+    const response = await sendGPTRequest(gptRequest, responseType);
 
     console.log("[GPT] Response status:", response.status);
 
@@ -829,14 +833,46 @@ async function handleGPTRequest(req, res) {
     }
 
     try {
-        const openAIResponse = transformGPTResponse(response.data);
-        const toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
+        let openAIResponse = transformGPTResponse(response.data);
+        let toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
         console.log("[GPT] tool_calls in response:", toolCallCount);
+
+        // If tools were available but auto produced none, retry once with required.
+        if (hasToolsInRequest && !requiresToolCalls && toolCallCount === 0) {
+            console.warn("[GPT] Auto mode returned zero tool calls; retrying with tool_choice=required");
+            const retryPayload = {
+                ...gptRequest,
+                tool_choice: "required",
+                stream: false,
+            };
+            const retryResponse = await sendGPTRequest(retryPayload, "json");
+            console.log("[GPT] Retry response status:", retryResponse.status);
+
+            if (retryResponse.status >= 400) {
+                const retryError = retryResponse.data?.error?.message || "GPT API retry error";
+                return res.status(retryResponse.status).json({
+                    error: { message: retryError, type: "api_error" }
+                });
+            }
+
+            openAIResponse = transformGPTResponse(retryResponse.data);
+            toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
+            console.log("[GPT] tool_calls after required retry:", toolCallCount);
+        }
+
         if (requiresToolCalls && toolCallCount === 0) {
             console.warn("[GPT] WARNING: tool_choice=required but response had zero tool_calls");
             return res.status(502).json({
                 error: {
                     message: "tool_choice=required but model returned no tool calls",
+                    type: "tool_protocol_error"
+                }
+            });
+        }
+        if (hasToolsInRequest && toolCallCount === 0) {
+            return res.status(502).json({
+                error: {
+                    message: "Tools were provided, but model returned no tool calls after retry",
                     type: "tool_protocol_error"
                 }
             });
