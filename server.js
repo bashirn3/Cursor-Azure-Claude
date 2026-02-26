@@ -948,7 +948,7 @@ async function handleGPTRequest(req, res) {
                                 roleSent = true;
                             }
                             this.push(`data: ${chatChunk({ content: p.delta || "" })}\n\n`);
-                        } else if (etype === "response.output_item.added" && p.item?.type === "function_call") {
+                        } else if (etype === "response.output_item.added" && (p.item?.type === "function_call" || p.item?.type === "custom_tool_call")) {
                             hasTools = true;
                             const callId = p.item.call_id || p.item.id;
                             const idx = toolIdx++;
@@ -957,11 +957,11 @@ async function handleGPTRequest(req, res) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: null })}\n\n`);
                                 roleSent = true;
                             }
-                            console.log("[GPT][TOOL]", requestId, "index:", idx, "name:", p.item.name, "call_id:", callId);
+                            console.log("[GPT][TOOL]", requestId, "type:", p.item.type, "index:", idx, "name:", p.item.name, "call_id:", callId);
                             this.push(`data: ${chatChunk({
                                 tool_calls: [{ index: idx, id: callId, type: "function", function: { name: p.item.name || "", arguments: "" } }]
                             })}\n\n`);
-                        } else if (etype === "response.function_call_arguments.delta") {
+                        } else if (etype === "response.function_call_arguments.delta" || etype === "response.custom_tool_call_input.delta") {
                             const callId = p.call_id || p.item_id;
                             const idx = toolMap[callId] ?? 0;
                             this.push(`data: ${chatChunk({
@@ -1044,4 +1044,5 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+
 
