@@ -15,6 +15,7 @@ const CONFIG = {
     AZURE_OPENAI_ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_API_KEY: process.env.AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_MODEL: process.env.AZURE_OPENAI_MODEL || "gpt-5.3-codex",
+    GPT_STREAM_TOOLS: process.env.GPT_STREAM_TOOLS === "1",
     
     // Service auth
     SERVICE_API_KEY: process.env.SERVICE_API_KEY,
@@ -250,28 +251,47 @@ function transformRequestForGPT(openAIRequest) {
 
     let inputItems = [];
     let systemPrompt = null;
+    const textFromParts = (content) => {
+        if (typeof content === "string") return content;
+        if (!Array.isArray(content)) return "";
+        return content
+            .map((c) => {
+                if (!c) return "";
+                if (typeof c === "string") return c;
+                if (c.type === "text" || c.type === "input_text" || c.type === "output_text") return c.text || "";
+                return "";
+            })
+            .filter(Boolean)
+            .join("\n");
+    };
+
+    const normalizeToolOutput = (content) => {
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+            const text = textFromParts(content);
+            return text || JSON.stringify(content);
+        }
+        if (content === undefined || content === null) return "";
+        if (typeof content === "object") return JSON.stringify(content);
+        return String(content);
+    };
 
     if (messages && Array.isArray(messages)) {
         for (const msg of messages) {
             if (!msg) continue;
 
             if (msg.role === "system") {
-                const text = typeof msg.content === "string" ? msg.content :
-                    (Array.isArray(msg.content) ? msg.content.map(c => c.text || c.content || "").join("\n") : "");
+                const text = textFromParts(msg.content);
                 systemPrompt = systemPrompt ? systemPrompt + "\n" + text : text;
             } else if (msg.role === "user") {
-                let content = msg.content;
-                if (typeof content === "string") {
-                    inputItems.push({ type: "message", role: "user", content: content });
-                } else if (Array.isArray(content)) {
-                    const textParts = content.filter(c => c.type === "text").map(c => c.text).join("\n");
-                    if (textParts) {
-                        inputItems.push({ type: "message", role: "user", content: textParts });
-                    }
+                const contentText = textFromParts(msg.content);
+                if (contentText) {
+                    inputItems.push({ type: "message", role: "user", content: contentText });
                 }
             } else if (msg.role === "assistant") {
-                if (msg.content) {
-                    inputItems.push({ type: "message", role: "assistant", content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content) });
+                const contentText = textFromParts(msg.content);
+                if (contentText) {
+                    inputItems.push({ type: "message", role: "assistant", content: contentText });
                 }
                 if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
                     for (const tc of msg.tool_calls) {
@@ -283,11 +303,11 @@ function transformRequestForGPT(openAIRequest) {
                         });
                     }
                 }
-            } else if (msg.role === "tool") {
+            } else if (msg.role === "tool" || msg.role === "function") {
                 inputItems.push({
                     type: "function_call_output",
                     call_id: msg.tool_call_id,
-                    output: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
+                    output: normalizeToolOutput(msg.content)
                 });
             }
         }
@@ -304,11 +324,19 @@ function transformRequestForGPT(openAIRequest) {
                     continue;
                 }
                 if (item.type === "message" && item.content) {
-                    inputItems.push({ type: "message", role: item.role || "user", content: item.content });
+                    inputItems.push({
+                        type: "message",
+                        role: item.role || "user",
+                        content: typeof item.content === "string" ? item.content : textFromParts(item.content)
+                    });
                     continue;
                 }
                 if (item.role && item.content) {
-                    inputItems.push({ type: "message", role: item.role, content: item.content });
+                    inputItems.push({
+                        type: "message",
+                        role: item.role,
+                        content: typeof item.content === "string" ? item.content : textFromParts(item.content)
+                    });
                 }
             }
         }
@@ -374,6 +402,54 @@ function transformRequestForGPT(openAIRequest) {
     }
 
     return gptRequest;
+}
+
+function writeSSEFromChatCompletion(req, res, openAIResponse) {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+
+    const chunk = {
+        id: openAIResponse.id || "chatcmpl-" + Date.now(),
+        object: "chat.completion.chunk",
+        created: openAIResponse.created || Math.floor(Date.now() / 1000),
+        model: openAIResponse.model || req.body.model || CONFIG.AZURE_OPENAI_MODEL,
+        choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: null,
+        }],
+    };
+
+    const message = openAIResponse.choices?.[0]?.message || {};
+    const finishReason = openAIResponse.choices?.[0]?.finish_reason || "stop";
+    const content = message.content || "";
+    if (content) {
+        chunk.choices[0].delta.content = content;
+    }
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+        chunk.choices[0].delta.tool_calls = message.tool_calls.map((tc, idx) => ({
+            index: idx,
+            id: tc.id,
+            type: "function",
+            function: {
+                name: tc.function?.name || "",
+                arguments: tc.function?.arguments || "{}"
+            }
+        }));
+    }
+
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    res.write(`data: ${JSON.stringify({
+        id: openAIResponse.id || "chatcmpl-" + Date.now(),
+        object: "chat.completion.chunk",
+        created: openAIResponse.created || Math.floor(Date.now() / 1000),
+        model: openAIResponse.model || req.body.model || CONFIG.AZURE_OPENAI_MODEL,
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+    })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    res.end();
 }
 
 function transformGPTResponse(gptResponse) {
@@ -696,19 +772,26 @@ async function handleGPTRequest(req, res) {
         return res.status(500).json({ error: { message: "GPT endpoint not configured (AZURE_OPENAI_ENDPOINT)", type: "configuration_error" } });
     }
 
-    const isStreaming = req.body.stream === true;
+    const clientRequestedStreaming = req.body.stream === true;
+    const hasToolsInRequest = Array.isArray(req.body.tools) && req.body.tools.length > 0;
+    const shouldBufferToolRequests = hasToolsInRequest && !CONFIG.GPT_STREAM_TOOLS;
 
     let gptRequest;
     try {
         gptRequest = transformRequestForGPT(req.body);
+        if (shouldBufferToolRequests && clientRequestedStreaming) {
+            // Tool requests are handled as non-stream upstream for deterministic tool args.
+            gptRequest.stream = false;
+        }
         console.log("[GPT] Model:", gptRequest.model, "Tools:", gptRequest.tools?.length || 0, "tool_choice:", gptRequest.tool_choice || "(none)");
-        console.log("[GPT] Input items:", gptRequest.input?.length || 0, "Stream:", isStreaming);
+        console.log("[GPT] Input items:", gptRequest.input?.length || 0, "Stream:", clientRequestedStreaming, "BufferedTools:", shouldBufferToolRequests);
     } catch (transformError) {
         console.error("[ERROR] Transform failed:", transformError.message);
         return res.status(400).json({ error: { message: "Transform error: " + transformError.message, type: "transform_error" } });
     }
 
     const requiresToolCalls = gptRequest.tool_choice === "required";
+    const responseType = gptRequest.stream === true ? "stream" : "json";
 
     const response = await axios.post(CONFIG.AZURE_OPENAI_ENDPOINT, gptRequest, {
         headers: {
@@ -716,7 +799,7 @@ async function handleGPTRequest(req, res) {
             "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
         },
         timeout: 300000,
-        responseType: isStreaming ? "stream" : "json",
+        responseType,
         validateStatus: (status) => status < 600,
     });
 
@@ -725,7 +808,7 @@ async function handleGPTRequest(req, res) {
     if (response.status >= 400) {
         let errorMessage = "GPT API error";
         if (response.data) {
-            if (isStreaming && typeof response.data.pipe === "function") {
+            if (responseType === "stream" && typeof response.data.pipe === "function") {
                 let errorBuffer = "";
                 await new Promise((resolve) => {
                     response.data.on("data", (chunk) => { errorBuffer += chunk.toString(); });
@@ -741,21 +824,31 @@ async function handleGPTRequest(req, res) {
         return res.status(response.status).json({ error: { message: errorMessage, type: "api_error" } });
     }
 
-    if (isStreaming) {
-        handleGPTStreaming(req, res, response, requiresToolCalls);
-    } else {
-        try {
-            const openAIResponse = transformGPTResponse(response.data);
-            const toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
-            console.log("[GPT] tool_calls in response:", toolCallCount);
-            if (requiresToolCalls && toolCallCount === 0) {
-                console.warn("[GPT] WARNING: tool_choice=required but response had zero tool_calls");
-            }
-            res.json(openAIResponse);
-        } catch (transformError) {
-            console.error("[ERROR] Response transform failed:", transformError.message);
-            return res.status(500).json({ error: { message: "Transform error", type: "transform_error" } });
+    if (responseType === "stream") {
+        return handleGPTStreaming(req, res, response, requiresToolCalls);
+    }
+
+    try {
+        const openAIResponse = transformGPTResponse(response.data);
+        const toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
+        console.log("[GPT] tool_calls in response:", toolCallCount);
+        if (requiresToolCalls && toolCallCount === 0) {
+            console.warn("[GPT] WARNING: tool_choice=required but response had zero tool_calls");
+            return res.status(502).json({
+                error: {
+                    message: "tool_choice=required but model returned no tool calls",
+                    type: "tool_protocol_error"
+                }
+            });
         }
+
+        if (clientRequestedStreaming && shouldBufferToolRequests) {
+            return writeSSEFromChatCompletion(req, res, openAIResponse);
+        }
+        return res.json(openAIResponse);
+    } catch (transformError) {
+        console.error("[ERROR] Response transform failed:", transformError.message);
+        return res.status(500).json({ error: { message: "Transform error", type: "transform_error" } });
     }
 }
 
@@ -978,5 +1071,4 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
-
 
