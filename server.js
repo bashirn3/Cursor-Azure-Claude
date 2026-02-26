@@ -16,6 +16,7 @@ const CONFIG = {
     AZURE_OPENAI_API_KEY: process.env.AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_MODEL: process.env.AZURE_OPENAI_MODEL || "gpt-5.3-codex",
     GPT_STREAM_TOOLS: process.env.GPT_STREAM_TOOLS === "1",
+    STRICT_TOOL_PROTOCOL: process.env.STRICT_TOOL_PROTOCOL !== "0",
     
     // Service auth
     SERVICE_API_KEY: process.env.SERVICE_API_KEY,
@@ -765,6 +766,9 @@ function handleClaudeStreaming(req, res, response) {
 }
 
 async function handleGPTRequest(req, res) {
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    res.setHeader("x-proxy-request-id", requestId);
+
     if (!CONFIG.AZURE_OPENAI_API_KEY) {
         return res.status(500).json({ error: { message: "GPT API key not configured (AZURE_OPENAI_API_KEY)", type: "configuration_error" } });
     }
@@ -775,6 +779,16 @@ async function handleGPTRequest(req, res) {
     const clientRequestedStreaming = req.body.stream === true;
     const hasToolsInRequest = Array.isArray(req.body.tools) && req.body.tools.length > 0;
     const shouldBufferToolRequests = hasToolsInRequest && !CONFIG.GPT_STREAM_TOOLS;
+    const diagnostics = {
+        request_id: requestId,
+        client_stream: clientRequestedStreaming,
+        has_tools: hasToolsInRequest,
+        buffered_tools: shouldBufferToolRequests,
+        initial_tool_choice: null,
+        initial_tool_calls: null,
+        retried_required: false,
+        retry_tool_calls: null,
+    };
 
     let gptRequest;
     try {
@@ -783,8 +797,9 @@ async function handleGPTRequest(req, res) {
             // Tool requests are handled as non-stream upstream for deterministic tool args.
             gptRequest.stream = false;
         }
+        diagnostics.initial_tool_choice = gptRequest.tool_choice || "auto";
         console.log("[GPT] Model:", gptRequest.model, "Tools:", gptRequest.tools?.length || 0, "tool_choice:", gptRequest.tool_choice || "(none)");
-        console.log("[GPT] Input items:", gptRequest.input?.length || 0, "Stream:", clientRequestedStreaming, "BufferedTools:", shouldBufferToolRequests);
+        console.log("[GPT] Request:", requestId, "Input items:", gptRequest.input?.length || 0, "Stream:", clientRequestedStreaming, "BufferedTools:", shouldBufferToolRequests);
     } catch (transformError) {
         console.error("[ERROR] Transform failed:", transformError.message);
         return res.status(400).json({ error: { message: "Transform error: " + transformError.message, type: "transform_error" } });
@@ -835,11 +850,13 @@ async function handleGPTRequest(req, res) {
     try {
         let openAIResponse = transformGPTResponse(response.data);
         let toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
+        diagnostics.initial_tool_calls = toolCallCount;
         console.log("[GPT] tool_calls in response:", toolCallCount);
 
         // If tools were available but auto produced none, retry once with required.
         if (hasToolsInRequest && !requiresToolCalls && toolCallCount === 0) {
             console.warn("[GPT] Auto mode returned zero tool calls; retrying with tool_choice=required");
+            diagnostics.retried_required = true;
             const retryPayload = {
                 ...gptRequest,
                 tool_choice: "required",
@@ -857,6 +874,7 @@ async function handleGPTRequest(req, res) {
 
             openAIResponse = transformGPTResponse(retryResponse.data);
             toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
+            diagnostics.retry_tool_calls = toolCallCount;
             console.log("[GPT] tool_calls after required retry:", toolCallCount);
         }
 
@@ -865,15 +883,18 @@ async function handleGPTRequest(req, res) {
             return res.status(502).json({
                 error: {
                     message: "tool_choice=required but model returned no tool calls",
-                    type: "tool_protocol_error"
+                    type: "tool_protocol_error",
+                    details: diagnostics
                 }
             });
         }
-        if (hasToolsInRequest && toolCallCount === 0) {
+        if (CONFIG.STRICT_TOOL_PROTOCOL && hasToolsInRequest && toolCallCount === 0) {
+            console.error("[GPT] Tool protocol violation:", JSON.stringify(diagnostics));
             return res.status(502).json({
                 error: {
                     message: "Tools were provided, but model returned no tool calls after retry",
-                    type: "tool_protocol_error"
+                    type: "tool_protocol_error",
+                    details: diagnostics
                 }
             });
         }
