@@ -15,7 +15,7 @@ const CONFIG = {
     AZURE_OPENAI_ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_API_KEY: process.env.AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_MODEL: process.env.AZURE_OPENAI_MODEL || "gpt-5.3-codex",
-    GPT_USE_CHAT_COMPLETIONS: process.env.GPT_USE_CHAT_COMPLETIONS !== "0",
+    AZURE_OPENAI_DEPLOYMENT: process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || "gpt-5.3-codex",
     
     // Service auth
     SERVICE_API_KEY: process.env.SERVICE_API_KEY,
@@ -786,7 +786,14 @@ function handleClaudeStreaming(req, res, response) {
 
 function getGPTChatEndpoint() {
     const endpoint = CONFIG.AZURE_OPENAI_ENDPOINT || "";
-    return endpoint.replace(/\/openai\/responses/, "/openai/chat/completions");
+    // Extract base URL (everything before /openai/...)
+    const match = endpoint.match(/^(https?:\/\/[^/]+)/);
+    if (!match) return endpoint.replace(/\/openai\/responses/, "/openai/chat/completions");
+    const baseUrl = match[1];
+    // Extract api-version from query string
+    const versionMatch = endpoint.match(/api-version=([^&]+)/);
+    const apiVersion = versionMatch ? versionMatch[1] : "2025-04-01-preview";
+    return `${baseUrl}/openai/deployments/${CONFIG.AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${apiVersion}`;
 }
 
 async function handleGPTRequest(req, res) {
@@ -808,13 +815,19 @@ async function handleGPTRequest(req, res) {
 
     const toolCount = Array.isArray(req.body.tools) ? req.body.tools.length : 0;
     const msgCount = Array.isArray(req.body.messages) ? req.body.messages.length : 0;
+    const bodyKeys = Object.keys(req.body).join(", ");
     console.log("[GPT][PASSTHROUGH]", requestId,
-        "Endpoint:", chatEndpoint.substring(0, 80) + "...",
+        "Endpoint:", chatEndpoint,
         "Model:", CONFIG.AZURE_OPENAI_MODEL,
         "Messages:", msgCount,
         "Tools:", toolCount,
         "Stream:", isStreaming,
-        "tool_choice:", req.body.tool_choice || "(none)");
+        "tool_choice:", req.body.tool_choice || "(none)",
+        "body_keys:", bodyKeys);
+    if (msgCount > 0) {
+        const first = req.body.messages[0];
+        console.log("[GPT][PASSTHROUGH] First message role:", first?.role, "content_type:", typeof first?.content);
+    }
 
     try {
         const response = await axios.post(chatEndpoint, forwardBody, {
@@ -924,4 +937,3 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
-;
