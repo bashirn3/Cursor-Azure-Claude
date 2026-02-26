@@ -848,7 +848,18 @@ async function handleGPTRequest(req, res) {
             res.setHeader("Cache-Control", "no-cache");
             res.setHeader("Connection", "keep-alive");
             res.setHeader("X-Accel-Buffering", "no");
-            response.data.pipe(res);
+
+            let logged = 0;
+            const { PassThrough } = require("stream");
+            const tap = new PassThrough();
+            tap.on("data", (chunk) => {
+                if (logged < 2000) {
+                    const text = chunk.toString();
+                    console.log("[GPT][SSE-TAP]", requestId, text.slice(0, 2000 - logged));
+                    logged += text.length;
+                }
+            });
+            response.data.pipe(tap).pipe(res);
         } else {
             res.json(response.data);
         }
