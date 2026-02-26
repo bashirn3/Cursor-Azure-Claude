@@ -11,12 +11,11 @@ const CONFIG = {
     AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
     ANTHROPIC_VERSION: "2023-06-01",
     
-    // GPT (OpenAI) on Azure - Responses API
+    // GPT (OpenAI) on Azure
     AZURE_OPENAI_ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_API_KEY: process.env.AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_MODEL: process.env.AZURE_OPENAI_MODEL || "gpt-5.3-codex",
-    GPT_STREAM_TOOLS: process.env.GPT_STREAM_TOOLS === "1",
-    STRICT_TOOL_PROTOCOL: process.env.STRICT_TOOL_PROTOCOL !== "0",
+    GPT_USE_CHAT_COMPLETIONS: process.env.GPT_USE_CHAT_COMPLETIONS !== "0",
     
     // Service auth
     SERVICE_API_KEY: process.env.SERVICE_API_KEY,
@@ -785,6 +784,11 @@ function handleClaudeStreaming(req, res, response) {
     });
 }
 
+function getGPTChatEndpoint() {
+    const endpoint = CONFIG.AZURE_OPENAI_ENDPOINT || "";
+    return endpoint.replace(/\/openai\/responses/, "/openai/chat/completions");
+}
+
 async function handleGPTRequest(req, res) {
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -796,301 +800,74 @@ async function handleGPTRequest(req, res) {
     }
 
     const isStreaming = req.body.stream === true;
+    const chatEndpoint = getGPTChatEndpoint();
 
-    let gptRequest;
-    try {
-        gptRequest = transformRequestForGPT(req.body);
-        console.log("[GPT]", requestId, "Model:", gptRequest.model,
-            "Tools:", gptRequest.tools?.length || 0,
-            "tool_choice:", gptRequest.tool_choice || "(none)",
-            "Input items:", gptRequest.input?.length || 0,
-            "Stream:", isStreaming);
+    // Pass-through: forward the Chat Completions request to Azure as-is.
+    // Only override the model name to match the Azure deployment.
+    const forwardBody = { ...req.body, model: CONFIG.AZURE_OPENAI_MODEL };
 
-        // Dump first 3 input items and instructions snippet for debugging
-        if (gptRequest.input) {
-            const preview = gptRequest.input.slice(0, 3).map((item, i) => {
-                const content = typeof item.content === "string"
-                    ? item.content.substring(0, 120)
-                    : "(non-string)";
-                return `  [${i}] type=${item.type} role=${item.role || "-"} content=${content}...`;
-            });
-            console.log("[GPT][DEBUG] Input preview:\n" + preview.join("\n"));
-        }
-        if (gptRequest.instructions) {
-            console.log("[GPT][DEBUG] Instructions length:", gptRequest.instructions.length,
-                "preview:", gptRequest.instructions.substring(0, 200) + "...");
-        }
-        if (gptRequest.tools && gptRequest.tools.length > 0) {
-            const toolNames = gptRequest.tools.map(t => t.name).join(", ");
-            console.log("[GPT][DEBUG] Tool names:", toolNames);
-        }
-    } catch (transformError) {
-        console.error("[ERROR] Transform failed:", transformError.message);
-        return res.status(400).json({ error: { message: "Transform error: " + transformError.message, type: "transform_error" } });
-    }
-
-    const response = await axios.post(CONFIG.AZURE_OPENAI_ENDPOINT, gptRequest, {
-        headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
-        },
-        timeout: 300000,
-        responseType: isStreaming ? "stream" : "json",
-        validateStatus: (status) => status < 600,
-    });
-
-    console.log("[GPT]", requestId, "Response status:", response.status);
-
-    if (response.status >= 400) {
-        let errorMessage = "GPT API error";
-        if (response.data) {
-            if (isStreaming && typeof response.data.pipe === "function") {
-                let errorBuffer = "";
-                await new Promise((resolve) => {
-                    response.data.on("data", (chunk) => { errorBuffer += chunk.toString(); });
-                    response.data.on("end", resolve);
-                    response.data.on("error", resolve);
-                });
-                try { errorMessage = JSON.parse(errorBuffer)?.error?.message || errorBuffer; } catch (e) { errorMessage = errorBuffer; }
-            } else if (response.data.error) {
-                errorMessage = response.data.error.message;
-            }
-        }
-        console.error("[GPT] Error from Azure:", errorMessage);
-        return res.status(response.status).json({ error: { message: errorMessage, type: "api_error" } });
-    }
-
-    if (isStreaming) {
-        return handleGPTStreaming(req, res, response);
-    }
+    const toolCount = Array.isArray(req.body.tools) ? req.body.tools.length : 0;
+    const msgCount = Array.isArray(req.body.messages) ? req.body.messages.length : 0;
+    console.log("[GPT][PASSTHROUGH]", requestId,
+        "Endpoint:", chatEndpoint.substring(0, 80) + "...",
+        "Model:", CONFIG.AZURE_OPENAI_MODEL,
+        "Messages:", msgCount,
+        "Tools:", toolCount,
+        "Stream:", isStreaming,
+        "tool_choice:", req.body.tool_choice || "(none)");
 
     try {
-        const openAIResponse = transformGPTResponse(response.data);
-        const toolCallCount = openAIResponse.choices?.[0]?.message?.tool_calls?.length || 0;
-        console.log("[GPT]", requestId, "tool_calls:", toolCallCount,
-            "finish_reason:", openAIResponse.choices?.[0]?.finish_reason);
-        if (toolCallCount > 0) {
-            const names = openAIResponse.choices[0].message.tool_calls.map(tc => tc.function?.name);
-            console.log("[GPT]", requestId, "tool names:", names.join(", "));
-        }
-        return res.json(openAIResponse);
-    } catch (transformError) {
-        console.error("[ERROR] Response transform failed:", transformError.message);
-        return res.status(500).json({ error: { message: "Transform error", type: "transform_error" } });
-    }
-}
+        const response = await axios.post(chatEndpoint, forwardBody, {
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
+                "api-key": CONFIG.AZURE_OPENAI_API_KEY,
+            },
+            timeout: 300000,
+            responseType: isStreaming ? "stream" : "json",
+            validateStatus: (status) => status < 600,
+        });
 
-function handleGPTStreaming(req, res, response) {
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no");
+        console.log("[GPT][PASSTHROUGH]", requestId, "Response status:", response.status);
 
-    let buffer = "";
-    let currentToolCallIndex = 0;
-    let didSendDone = false;
-    let sentFirstDelta = false;
-    const toolCallArgs = {};
-
-    const writeSSE = (payload) => {
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    };
-
-    response.data.on("data", (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop();
-
-        for (const line of lines) {
-            if (!line.startsWith("data: ") && !line.startsWith("event: ")) continue;
-            if (line.startsWith("event: ")) continue;
-            const data = line.slice(6).trim();
-            if (data === "[DONE]") {
-                if (!didSendDone) {
-                    res.write("data: [DONE]\n\n");
-                    didSendDone = true;
+        if (response.status >= 400) {
+            let errorMessage = "GPT API error";
+            if (response.data) {
+                if (isStreaming && typeof response.data.pipe === "function") {
+                    let errorBuffer = "";
+                    await new Promise((resolve) => {
+                        response.data.on("data", (chunk) => { errorBuffer += chunk.toString(); });
+                        response.data.on("end", resolve);
+                        response.data.on("error", resolve);
+                    });
+                    try { errorMessage = JSON.parse(errorBuffer)?.error?.message || errorBuffer; } catch (e) { errorMessage = errorBuffer; }
+                } else if (response.data.error) {
+                    errorMessage = typeof response.data.error === "string" ? response.data.error : response.data.error.message;
                 }
-                continue;
             }
-
-            try {
-                const event = JSON.parse(data);
-
-                if (event.object === "chat.completion.chunk" && Array.isArray(event.choices)) {
-                    writeSSE(event);
-                    continue;
-                }
-
-                if (event.type === "response.output_item.added") {
-                    if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
-                        const callId = event.item.call_id || event.item.id;
-                        const name = event.item.name || "";
-                        console.log("[GPT][STREAM] function_call started:", name, "call_id:", callId);
-                        toolCallArgs[currentToolCallIndex] = "";
-
-                        const delta = {
-                            tool_calls: [{
-                                index: currentToolCallIndex,
-                                id: callId,
-                                type: "function",
-                                function: { name, arguments: "" }
-                            }]
-                        };
-                        if (!sentFirstDelta) {
-                            delta.role = "assistant";
-                            delta.content = null;
-                            sentFirstDelta = true;
-                        }
-                        writeSSE({
-                            id: "chatcmpl-" + Date.now(),
-                            object: "chat.completion.chunk",
-                            created: Math.floor(Date.now() / 1000),
-                            model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-                            choices: [{
-                                index: 0,
-                                delta,
-                                logprobs: null,
-                                finish_reason: null,
-                            }],
-                        });
-                    } else if (event.item?.type === "message") {
-                        if (!sentFirstDelta) {
-                            writeSSE({
-                                id: "chatcmpl-" + Date.now(),
-                                object: "chat.completion.chunk",
-                                created: Math.floor(Date.now() / 1000),
-                                model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-                                choices: [{
-                                    index: 0,
-                                    delta: { role: "assistant", content: "" },
-                                    logprobs: null,
-                                    finish_reason: null,
-                                }],
-                            });
-                            sentFirstDelta = true;
-                        }
-                    }
-                } else if (event.type === "response.output_text.delta" || event.type === "response.text.delta") {
-                    const textDelta = event.delta || "";
-                    if (!sentFirstDelta) {
-                        writeSSE({
-                            id: "chatcmpl-" + Date.now(),
-                            object: "chat.completion.chunk",
-                            created: Math.floor(Date.now() / 1000),
-                            model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-                            choices: [{ index: 0, delta: { role: "assistant", content: "" }, logprobs: null, finish_reason: null }],
-                        });
-                        sentFirstDelta = true;
-                    }
-                    writeSSE({
-                        id: "chatcmpl-" + Date.now(),
-                        object: "chat.completion.chunk",
-                        created: Math.floor(Date.now() / 1000),
-                        model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-                        choices: [{
-                            index: 0,
-                            delta: { content: textDelta },
-                            logprobs: null,
-                            finish_reason: null,
-                        }],
-                    });
-                } else if (event.type === "response.function_call_arguments.delta") {
-                    const argsDelta = event.delta || event.arguments_delta || "";
-                    if (toolCallArgs[currentToolCallIndex] !== undefined) {
-                        toolCallArgs[currentToolCallIndex] += argsDelta;
-                    }
-                    writeSSE({
-                        id: "chatcmpl-" + Date.now(),
-                        object: "chat.completion.chunk",
-                        created: Math.floor(Date.now() / 1000),
-                        model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-                        choices: [{
-                            index: 0,
-                            delta: {
-                                tool_calls: [{
-                                    index: currentToolCallIndex,
-                                    function: { arguments: argsDelta }
-                                }]
-                            },
-                            logprobs: null,
-                            finish_reason: null,
-                        }],
-                    });
-                } else if (event.type === "response.output_item.done") {
-                    if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
-                        const name = event.item.name || "(unknown)";
-                        const args = toolCallArgs[currentToolCallIndex] || "";
-                        console.log("[GPT][STREAM] function_call done:", name,
-                            "args_length:", args.length,
-                            "args_preview:", args.substring(0, 200));
-                        currentToolCallIndex++;
-                    }
-                } else if (event.type === "response.done" || event.type === "response.completed") {
-                    const responseOutput = event.response?.output;
-                    if (Array.isArray(responseOutput)) {
-                        const toolCount = responseOutput.filter(i => i?.type === "function_call").length;
-                        console.log("[GPT][STREAM] response.done — tool_calls:", toolCount, "total_output_items:", responseOutput.length);
-                    }
-                    writeSSE({
-                        id: "chatcmpl-" + Date.now(),
-                        object: "chat.completion.chunk",
-                        created: Math.floor(Date.now() / 1000),
-                        model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-                        choices: [{
-                            index: 0,
-                            delta: {},
-                            logprobs: null,
-                            finish_reason: currentToolCallIndex > 0 ? "tool_calls" : "stop",
-                        }],
-                    });
-                    res.write("data: [DONE]\n\n");
-                    didSendDone = true;
-                } else if (event.type === "response.content_part.delta" && event.delta?.text) {
-                    writeSSE({
-                        id: "chatcmpl-" + Date.now(),
-                        object: "chat.completion.chunk",
-                        created: Math.floor(Date.now() / 1000),
-                        model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-                        choices: [{
-                            index: 0,
-                            delta: { content: event.delta.text },
-                            finish_reason: null,
-                        }],
-                    });
-                }
-            } catch (e) {
-                // Not all lines are JSON; skip silently
-            }
+            console.error("[GPT][PASSTHROUGH] Error:", errorMessage);
+            return res.status(response.status).json({ error: { message: errorMessage, type: "api_error" } });
         }
-    });
 
-    response.data.on("end", () => {
-        console.log("[GPT] Stream ended. tool_calls seen:", currentToolCallIndex);
-        if (!didSendDone) {
-            writeSSE({
-                id: "chatcmpl-" + Date.now(),
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: req.body.model || CONFIG.AZURE_OPENAI_MODEL,
-                choices: [{
-                    index: 0,
-                    delta: {},
-                    finish_reason: currentToolCallIndex > 0 ? "tool_calls" : "stop",
-                }],
-            });
-            res.write("data: [DONE]\n\n");
-        }
-        res.end();
-    });
-
-    response.data.on("error", (error) => {
-        console.error("[ERROR] GPT Stream error:", error.message);
-        if (!res.headersSent) {
-            res.status(500).json({ error: { message: "Stream error", type: "stream_error" } });
+        if (isStreaming) {
+            res.setHeader("Content-Type", "text/event-stream");
+            res.setHeader("Cache-Control", "no-cache");
+            res.setHeader("Connection", "keep-alive");
+            res.setHeader("X-Accel-Buffering", "no");
+            response.data.pipe(res);
         } else {
-            res.end();
+            const toolCallCount = response.data?.choices?.[0]?.message?.tool_calls?.length || 0;
+            console.log("[GPT][PASSTHROUGH]", requestId, "tool_calls:", toolCallCount,
+                "finish_reason:", response.data?.choices?.[0]?.finish_reason);
+            res.json(response.data);
         }
-    });
+    } catch (error) {
+        console.error("[GPT][PASSTHROUGH] Error:", error.message);
+        if (error.response) {
+            return res.status(error.response.status).json(error.response.data || { error: { message: error.message, type: "api_error" } });
+        }
+        return res.status(502).json({ error: { message: error.message, type: "proxy_error" } });
+    }
 }
 
 app.post("/v1/chat/completions", requireAuth, (req, res) => {
@@ -1135,14 +912,16 @@ app.use((req, res) => {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
-    console.log("Azure Multi-Model Proxy v4.1 - Claude + GPT (Responses API)");
+    console.log("Azure Multi-Model Proxy v5.0 - Claude + GPT (Chat Completions Pass-through)");
     console.log("=".repeat(60));
     console.log(`Server: 0.0.0.0:${CONFIG.PORT}`);
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
     console.log(`GPT: ${CONFIG.AZURE_OPENAI_API_KEY ? "Configured" : "MISSING"}`);
+    console.log(`GPT Chat Endpoint: ${getGPTChatEndpoint()}`);
     console.log(`Endpoints: /chat/completions, /v1/chat/completions, /v1/messages`);
     console.log("=".repeat(60));
 });
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+;
