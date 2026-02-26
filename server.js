@@ -357,7 +357,7 @@ function transformRequestForGPT(openAIRequest) {
             .filter(Boolean);
 
         if (!tool_choice) {
-            gptRequest.tool_choice = "required";
+            gptRequest.tool_choice = "auto";
         }
     }
 
@@ -978,4 +978,5 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+
 
