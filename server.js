@@ -799,6 +799,7 @@ async function handleGPTRequest(req, res) {
     const {
         stream_options, messages, max_tokens, n, stop, logprobs,
         top_logprobs, response_format, seed, logit_bias,
+        prompt_cache_retention, include,
         ...cleanBody
     } = req.body;
     const forwardBody = { ...cleanBody, model: CONFIG.AZURE_OPENAI_MODEL };
