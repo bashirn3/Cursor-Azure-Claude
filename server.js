@@ -796,7 +796,8 @@ async function handleGPTRequest(req, res) {
 
     const isStreaming = req.body.stream === true;
     const endpoint = CONFIG.AZURE_OPENAI_ENDPOINT;
-    const forwardBody = { ...req.body, model: CONFIG.AZURE_OPENAI_MODEL };
+    const { stream_options, ...cleanBody } = req.body;
+    const forwardBody = { ...cleanBody, model: CONFIG.AZURE_OPENAI_MODEL };
 
     const toolCount = Array.isArray(req.body.tools) ? req.body.tools.length : 0;
     const inputCount = Array.isArray(req.body.input) ? req.body.input.length : 0;
@@ -914,5 +915,4 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
-
 
