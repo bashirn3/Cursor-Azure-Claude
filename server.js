@@ -10,13 +10,18 @@ const CONFIG = {
     AZURE_API_KEY: process.env.AZURE_API_KEY,
     AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
     ANTHROPIC_VERSION: "2023-06-01",
-    
+
     // GPT (OpenAI) on Azure
     AZURE_OPENAI_ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT,
+    AZURE_OPENAI_ENDPOINT_GPT53: process.env.AZURE_OPENAI_ENDPOINT_GPT53,
+    AZURE_OPENAI_ENDPOINT_GPT54: process.env.AZURE_OPENAI_ENDPOINT_GPT54,
     AZURE_OPENAI_API_KEY: process.env.AZURE_OPENAI_API_KEY,
-    AZURE_OPENAI_MODEL: process.env.AZURE_OPENAI_MODEL || "gpt-5.3-codex",
-    AZURE_OPENAI_DEPLOYMENT: process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || "gpt-5.3-codex",
-    
+    AZURE_OPENAI_MODEL: process.env.AZURE_OPENAI_MODEL || process.env.DEFAULT_GPT_MODEL || "gpt-5.4",
+    AZURE_OPENAI_DEPLOYMENT: process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || process.env.DEFAULT_GPT_MODEL || "gpt-5.4",
+    AZURE_OPENAI_DEPLOYMENT_GPT53: process.env.AZURE_OPENAI_DEPLOYMENT_GPT53 || "gpt-5.3-codex",
+    AZURE_OPENAI_DEPLOYMENT_GPT54: process.env.AZURE_OPENAI_DEPLOYMENT_GPT54 || "gpt-5.4",
+    DEFAULT_GPT_MODEL: process.env.DEFAULT_GPT_MODEL || "gpt-5.4",
+
     // Service auth
     SERVICE_API_KEY: process.env.SERVICE_API_KEY,
     PORT: process.env.PORT || 8080,
@@ -28,14 +33,58 @@ const GPT_MODELS = ["gpt", "openai", "codex", "o1", "o3"];
 
 function isGPTModel(modelName) {
     if (!modelName) return false;
-    const lower = modelName.toLowerCase();
+    const lower = String(modelName).toLowerCase();
     return GPT_MODELS.some(pattern => lower.includes(pattern));
 }
 
 function isClaudeModel(modelName) {
-    if (!modelName) return true; // Default to Claude
-    const lower = modelName.toLowerCase();
+    if (!modelName) return false;
+    const lower = String(modelName).toLowerCase();
     return CLAUDE_MODELS.some(pattern => lower.includes(pattern));
+}
+
+function shouldUseGPT(modelName) {
+    if (!modelName) return true;
+    if (isClaudeModel(modelName)) return false;
+    if (isGPTModel(modelName)) return true;
+    return true;
+}
+
+function resolveGPTTarget(requestedModel = "") {
+    const lower = String(requestedModel).toLowerCase();
+
+    if (lower.includes("gpt-5.4")) {
+        return {
+            publicModel: "gpt-5.4",
+            deployment: CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT54,
+            endpoint: CONFIG.AZURE_OPENAI_ENDPOINT_GPT54 || CONFIG.AZURE_OPENAI_ENDPOINT,
+        };
+    }
+
+    if (lower.includes("gpt-5.3") || lower.includes("codex")) {
+        return {
+            publicModel: "gpt-5.3-codex",
+            deployment: CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT53,
+            endpoint: CONFIG.AZURE_OPENAI_ENDPOINT_GPT53 || CONFIG.AZURE_OPENAI_ENDPOINT,
+        };
+    }
+
+    if (
+        String(CONFIG.DEFAULT_GPT_MODEL).toLowerCase().includes("5.3") ||
+        String(CONFIG.DEFAULT_GPT_MODEL).toLowerCase().includes("codex")
+    ) {
+        return {
+            publicModel: "gpt-5.3-codex",
+            deployment: CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT53,
+            endpoint: CONFIG.AZURE_OPENAI_ENDPOINT_GPT53 || CONFIG.AZURE_OPENAI_ENDPOINT,
+        };
+    }
+
+    return {
+        publicModel: "gpt-5.4",
+        deployment: CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT54,
+        endpoint: CONFIG.AZURE_OPENAI_ENDPOINT_GPT54 || CONFIG.AZURE_OPENAI_ENDPOINT,
+    };
 }
 
 function fixImageTurns(messages) {
@@ -280,7 +329,7 @@ function transformRequestForGPT(openAIRequest) {
         for (const msg of messages) {
             if (!msg) continue;
 
-            if (msg.role === "system") {
+            if (msg.role === "system" || msg.role === "developer") {
                 const text = textFromParts(msg.content);
                 systemPrompt = systemPrompt ? systemPrompt + "\n" + text : text;
             } else if (msg.role === "user") {
@@ -362,7 +411,6 @@ function transformRequestForGPT(openAIRequest) {
     }
 
     const gptRequest = {
-        model: CONFIG.AZURE_OPENAI_MODEL,
         input: inputItems,
         max_output_tokens: max_tokens || 16384,
     };
@@ -472,14 +520,14 @@ function writeSSEFromChatCompletion(req, res, openAIResponse) {
     res.end();
 }
 
-function transformGPTResponse(gptResponse) {
-    const { id, model, output, usage } = gptResponse;
+function transformGPTResponse(gptResponse, publicModel) {
+    const { id, output, usage } = gptResponse;
 
     const response = {
         id: id || "chatcmpl-" + Date.now(),
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
-        model: model || CONFIG.AZURE_OPENAI_MODEL,
+        model: publicModel,
         choices: [{
             index: 0,
             message: { role: "assistant", content: null },
@@ -538,11 +586,11 @@ app.get("/", (req, res) => {
         status: "running",
         name: "Azure Multi-Model Proxy (Claude + GPT)",
         version: "4.1.0",
-        endpoints: { 
-            health: "/health", 
-            chat_cursor: "/chat/completions", 
-            chat_openai: "/v1/chat/completions", 
-            chat_anthropic: "/v1/messages" 
+        endpoints: {
+            health: "/health",
+            chat_cursor: "/chat/completions",
+            chat_openai: "/v1/chat/completions",
+            chat_anthropic: "/v1/messages"
         },
         models: {
             claude: CONFIG.AZURE_ENDPOINT ? "configured" : "not configured",
@@ -552,21 +600,21 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-    res.json({ 
-        status: "ok", 
-        timestamp: new Date().toISOString(), 
+    res.json({
+        status: "ok",
+        timestamp: new Date().toISOString(),
         claude: !!CONFIG.AZURE_API_KEY,
         gpt: !!CONFIG.AZURE_OPENAI_API_KEY,
-        port: CONFIG.PORT 
+        port: CONFIG.PORT
     });
 });
 
 app.post("/chat/completions", requireAuth, async (req, res) => {
     const modelName = req.body?.model || "";
-    const useGPT = isGPTModel(modelName);
-    
+    const useGPT = shouldUseGPT(modelName);
+
     console.log("[REQUEST /chat/completions]", new Date().toISOString());
-    console.log("Model:", modelName, "Route:", useGPT ? "GPT" : "Claude", "Stream:", req.body?.stream, "Tools:", req.body?.tools?.length || 0);
+    console.log("Model:", modelName || "(missing)", "Route:", useGPT ? "GPT" : "Claude", "Stream:", req.body?.stream, "Tools:", req.body?.tools?.length || 0);
 
     try {
         if (!req.body) {
@@ -786,66 +834,55 @@ function handleClaudeStreaming(req, res, response) {
 
 async function handleGPTRequest(req, res) {
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const requestedModel = req.body?.model || "";
+    const target = resolveGPTTarget(requestedModel);
 
     if (!CONFIG.AZURE_OPENAI_API_KEY) {
-        return res.status(500).json({ error: { message: "GPT API key not configured (AZURE_OPENAI_API_KEY)", type: "configuration_error" } });
+        return res.status(500).json({
+            error: {
+                message: "GPT API key not configured (AZURE_OPENAI_API_KEY)",
+                type: "configuration_error"
+            }
+        });
     }
-    if (!CONFIG.AZURE_OPENAI_ENDPOINT) {
-        return res.status(500).json({ error: { message: "GPT endpoint not configured (AZURE_OPENAI_ENDPOINT)", type: "configuration_error" } });
+
+    if (!target.endpoint) {
+        return res.status(500).json({
+            error: {
+                message: "GPT endpoint not configured",
+                type: "configuration_error"
+            }
+        });
     }
 
     const isStreaming = req.body.stream === true;
-    const endpoint = CONFIG.AZURE_OPENAI_ENDPOINT;
-    const {
-        stream_options, messages, max_tokens, n, stop, logprobs,
-        top_logprobs, response_format, seed, logit_bias,
-        prompt_cache_retention, include,
-        ...cleanBody
-    } = req.body;
-    const forwardBody = { ...cleanBody, model: CONFIG.AZURE_OPENAI_MODEL };
-    if (max_tokens && !forwardBody.max_output_tokens) {
-        forwardBody.max_output_tokens = max_tokens;
+
+    let forwardBody;
+    try {
+        forwardBody = transformRequestForGPT(req.body);
+        forwardBody.model = target.deployment;
+    } catch (transformError) {
+        console.error("[GPT][TRANSFORM] Error:", transformError.message);
+        return res.status(400).json({
+            error: {
+                message: "Transform error: " + transformError.message,
+                type: "transform_error"
+            }
+        });
     }
 
-    console.log("[GPT][REQ-KEYS]", requestId, "body keys:", Object.keys(req.body).join(", "));
-    console.log("[GPT][FWD-KEYS]", requestId, "forward keys:", Object.keys(forwardBody).join(", "));
-    if (Array.isArray(forwardBody.input) && forwardBody.input.length > 0) {
-        const summary = forwardBody.input.slice(0, 5).map((item, i) =>
-            `[${i}] type=${item.type || "?"} role=${item.role || "?"}`
-        ).join(", ");
-        console.log("[GPT][INPUT-PREVIEW]", requestId, summary, "... total:", forwardBody.input.length);
-    }
-
-    if (!forwardBody.instructions && Array.isArray(forwardBody.input)) {
-        const sysItems = forwardBody.input.filter(
-            item => item.role === "system" || item.role === "developer"
-        );
-        if (sysItems.length > 0) {
-            forwardBody.instructions = sysItems.map(item => {
-                if (typeof item.content === "string") return item.content;
-                if (Array.isArray(item.content)) return item.content.map(c => c.text || "").join("\n");
-                return "";
-            }).join("\n\n");
-            forwardBody.input = forwardBody.input.filter(
-                item => item.role !== "system" && item.role !== "developer"
-            );
-            console.log("[GPT][FIX]", requestId, "Moved system prompt to instructions, length:", forwardBody.instructions.length);
-        }
-    }
-
-    const toolCount = Array.isArray(forwardBody.tools) ? forwardBody.tools.length : 0;
-    const inputCount = Array.isArray(forwardBody.input) ? forwardBody.input.length : 0;
-    const msgCount = Array.isArray(forwardBody.messages) ? forwardBody.messages.length : 0;
-    console.log("[GPT][PIPE]", requestId,
-        "Endpoint:", endpoint,
-        "Model:", CONFIG.AZURE_OPENAI_MODEL,
-        "Input:", inputCount, "Messages:", msgCount,
-        "Tools:", toolCount,
+    console.log(
+        "[GPT][PIPE]",
+        requestId,
+        "Requested:", requestedModel || "(missing)",
+        "Public:", target.publicModel,
+        "Deployment:", target.deployment,
         "Stream:", isStreaming,
-        "tool_choice:", req.body.tool_choice || "(none)");
+        "Tools:", forwardBody.tools?.length || 0
+    );
 
     try {
-        const response = await axios.post(endpoint, forwardBody, {
+        const response = await axios.post(target.endpoint, forwardBody, {
             headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
@@ -895,7 +932,7 @@ async function handleGPTRequest(req, res) {
             function chatChunk(delta, finish) {
                 return JSON.stringify({
                     id: chatId, object: "chat.completion.chunk", created: chatCreated,
-                    model: CONFIG.AZURE_OPENAI_MODEL,
+                    model: target.publicModel,
                     choices: [{ index: 0, delta, finish_reason: finish || null }]
                 });
             }
@@ -979,7 +1016,7 @@ async function handleGPTRequest(req, res) {
 
             response.data.pipe(transformer).pipe(res);
         } else {
-            res.json(response.data);
+            res.json(transformGPTResponse(response.data, target.publicModel));
         }
     } catch (error) {
         console.error("[GPT][PIPE] Error:", error.message);
@@ -1038,11 +1075,10 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
     console.log(`GPT: ${CONFIG.AZURE_OPENAI_API_KEY ? "Configured" : "MISSING"}`);
     console.log(`GPT Endpoint: ${CONFIG.AZURE_OPENAI_ENDPOINT}`);
+    console.log(`Default GPT Model: ${CONFIG.DEFAULT_GPT_MODEL}`);
     console.log(`Endpoints: /chat/completions, /v1/chat/completions, /v1/messages`);
     console.log("=".repeat(60));
 });
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
-
-
