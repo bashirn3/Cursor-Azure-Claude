@@ -1,5 +1,8 @@
+require("dotenv").config();
+
 const express = require("express");
 const axios = require("axios");
+
 const app = express();
 
 app.use(express.json({ limit: "50mb" }));
@@ -11,13 +14,11 @@ const CONFIG = {
     AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
     ANTHROPIC_VERSION: "2023-06-01",
 
-    // GPT (OpenAI) on Azure
+    // GPT (Azure OpenAI / Azure AI Foundry)
     AZURE_OPENAI_ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_ENDPOINT_GPT53: process.env.AZURE_OPENAI_ENDPOINT_GPT53,
     AZURE_OPENAI_ENDPOINT_GPT54: process.env.AZURE_OPENAI_ENDPOINT_GPT54,
     AZURE_OPENAI_API_KEY: process.env.AZURE_OPENAI_API_KEY,
-    AZURE_OPENAI_MODEL: process.env.AZURE_OPENAI_MODEL || process.env.DEFAULT_GPT_MODEL || "gpt-5.4",
-    AZURE_OPENAI_DEPLOYMENT: process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || process.env.DEFAULT_GPT_MODEL || "gpt-5.4",
     AZURE_OPENAI_DEPLOYMENT_GPT53: process.env.AZURE_OPENAI_DEPLOYMENT_GPT53 || "gpt-5.3-codex",
     AZURE_OPENAI_DEPLOYMENT_GPT54: process.env.AZURE_OPENAI_DEPLOYMENT_GPT54 || "gpt-5.4",
     DEFAULT_GPT_MODEL: process.env.DEFAULT_GPT_MODEL || "gpt-5.4",
@@ -27,20 +28,19 @@ const CONFIG = {
     PORT: process.env.PORT || 8080,
 };
 
-// Model patterns for routing
 const CLAUDE_MODELS = ["claude", "anthropic"];
 const GPT_MODELS = ["gpt", "openai", "codex", "o1", "o3"];
 
 function isGPTModel(modelName) {
     if (!modelName) return false;
     const lower = String(modelName).toLowerCase();
-    return GPT_MODELS.some(pattern => lower.includes(pattern));
+    return GPT_MODELS.some((pattern) => lower.includes(pattern));
 }
 
 function isClaudeModel(modelName) {
     if (!modelName) return false;
     const lower = String(modelName).toLowerCase();
-    return CLAUDE_MODELS.some(pattern => lower.includes(pattern));
+    return CLAUDE_MODELS.some((pattern) => lower.includes(pattern));
 }
 
 function shouldUseGPT(modelName) {
@@ -69,10 +69,7 @@ function resolveGPTTarget(requestedModel = "") {
         };
     }
 
-    if (
-        String(CONFIG.DEFAULT_GPT_MODEL).toLowerCase().includes("5.3") ||
-        String(CONFIG.DEFAULT_GPT_MODEL).toLowerCase().includes("codex")
-    ) {
+    if (String(CONFIG.DEFAULT_GPT_MODEL).toLowerCase().includes("5.3") || String(CONFIG.DEFAULT_GPT_MODEL).toLowerCase().includes("codex")) {
         return {
             publicModel: "gpt-5.3-codex",
             deployment: CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT53,
@@ -92,8 +89,8 @@ function fixImageTurns(messages) {
     const fixed = [];
     for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
-        const hasImage = msg.content && Array.isArray(msg.content) && msg.content.some(c => c.type === "image_url");
-        if (hasImage && i > 0 && fixed[fixed.length - 1]?.role === "assistant") {
+        const hasImage = msg && msg.content && Array.isArray(msg.content) && msg.content.some((c) => c.type === "image_url");
+        if (hasImage && i > 0 && fixed[fixed.length - 1] && fixed[fixed.length - 1].role === "assistant") {
             fixed.pop();
         }
         fixed.push(msg);
@@ -123,19 +120,15 @@ function requireAuth(req, res, next) {
     if (!authHeader) {
         return res.status(401).json({ error: { message: "Missing Authorization header", type: "authentication_error" } });
     }
-    let token = authHeader.startsWith("Bearer ") ? authHeader.substring(7) : authHeader;
+    const token = authHeader.startsWith("Bearer ") ? authHeader.substring(7) : authHeader;
     if (token !== CONFIG.SERVICE_API_KEY) {
         return res.status(401).json({ error: { message: "Invalid API key", type: "authentication_error" } });
     }
     next();
 }
 
-// ============================================================================
-// CLAUDE (Anthropic) TRANSFORMATIONS
-// ============================================================================
-
 function transformRequestForClaude(openAIRequest) {
-    const { messages, model, max_tokens, temperature, stream, role, content, input, user, tools, tool_choice, ...rest } = openAIRequest;
+    const { messages, max_tokens, temperature, stream, role, content, input, user, tools, tool_choice, ...rest } = openAIRequest;
 
     let anthropicMessages;
 
@@ -152,8 +145,8 @@ function transformRequestForClaude(openAIRequest) {
                         content: [{
                             type: "tool_result",
                             tool_use_id: msg.tool_call_id || msg.name,
-                            content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
-                        }]
+                            content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
+                        }],
                     };
                 }
                 if (msg.role === "assistant" && msg.tool_calls && Array.isArray(msg.tool_calls)) {
@@ -167,14 +160,14 @@ function transformRequestForClaude(openAIRequest) {
                             args = typeof toolCall.function?.arguments === "string"
                                 ? JSON.parse(toolCall.function.arguments)
                                 : toolCall.function?.arguments || {};
-                        } catch (e) {
+                        } catch (error) {
                             args = {};
                         }
                         contentBlocks.push({
                             type: "tool_use",
                             id: toolCall.id,
                             name: toolCall.function?.name || toolCall.name,
-                            input: args
+                            input: args,
                         });
                     }
                     return { role: "assistant", content: contentBlocks };
@@ -185,15 +178,17 @@ function transformRequestForClaude(openAIRequest) {
         anthropicMessages = [{ role: role === "system" ? "user" : role, content: role === "system" ? `System: ${content}` : content }];
     } else if (input) {
         if (Array.isArray(input)) {
-            anthropicMessages = input.filter((msg) => msg && msg.content !== undefined).map((msg) => {
-                if (msg.role === "system") return { role: "user", content: `System: ${msg.content}` };
-                return { role: msg.role === "assistant" ? "assistant" : "user", content: msg.content };
-            });
+            anthropicMessages = input
+                .filter((msg) => msg && msg.content !== undefined)
+                .map((msg) => {
+                    if (msg.role === "system") return { role: "user", content: `System: ${msg.content}` };
+                    return { role: msg.role === "assistant" ? "assistant" : "user", content: msg.content };
+                });
         } else {
             anthropicMessages = [{ role: user || "user", content: input }];
         }
     } else if (content) {
-        anthropicMessages = [{ role: "user", content: content }];
+        anthropicMessages = [{ role: "user", content }];
     } else {
         throw new Error("Invalid request format");
     }
@@ -212,12 +207,12 @@ function transformRequestForClaude(openAIRequest) {
     if (stream !== undefined) anthropicRequest.stream = stream;
 
     if (tools && Array.isArray(tools) && tools.length > 0) {
-        anthropicRequest.tools = tools.map(tool => {
+        anthropicRequest.tools = tools.map((tool) => {
             if (tool.type === "function") {
                 return {
                     name: tool.function.name,
                     description: tool.function.description || "",
-                    input_schema: tool.function.parameters || { type: "object", properties: {} }
+                    input_schema: tool.function.parameters || { type: "object", properties: {} },
                 };
             }
             return tool;
@@ -231,7 +226,7 @@ function transformRequestForClaude(openAIRequest) {
             delete anthropicRequest.tools;
         } else if (tool_choice === "required") {
             anthropicRequest.tool_choice = { type: "any" };
-        } else if (typeof tool_choice === "object" && tool_choice.function?.name) {
+        } else if (typeof tool_choice === "object" && tool_choice.function && tool_choice.function.name) {
             anthropicRequest.tool_choice = { type: "tool", name: tool_choice.function.name };
         }
     }
@@ -252,10 +247,10 @@ function transformClaudeResponse(anthropicResponse) {
     const { content, id, model, stop_reason, usage } = anthropicResponse;
 
     const response = {
-        id: id,
+        id,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
-        model: model,
+        model,
         choices: [{
             index: 0,
             message: { role: "assistant", content: null },
@@ -279,7 +274,7 @@ function transformClaudeResponse(anthropicResponse) {
                 toolCalls.push({
                     id: block.id,
                     type: "function",
-                    function: { name: block.name, arguments: JSON.stringify(block.input) }
+                    function: { name: block.name, arguments: JSON.stringify(block.input) },
                 });
             }
         }
@@ -291,15 +286,12 @@ function transformClaudeResponse(anthropicResponse) {
     return response;
 }
 
-// ============================================================================
-// GPT (Azure OpenAI Responses API) TRANSFORMATIONS
-// ============================================================================
-
 function transformRequestForGPT(openAIRequest) {
-    const { messages, input, model, max_tokens, temperature, stream, tools, tool_choice, ...rest } = openAIRequest;
+    const { messages, input, max_tokens, temperature, stream, tools, tool_choice } = openAIRequest;
 
     let inputItems = [];
     let systemPrompt = null;
+
     const textFromParts = (content) => {
         if (typeof content === "string") return content;
         if (!Array.isArray(content)) return "";
@@ -331,24 +323,20 @@ function transformRequestForGPT(openAIRequest) {
 
             if (msg.role === "system" || msg.role === "developer") {
                 const text = textFromParts(msg.content);
-                systemPrompt = systemPrompt ? systemPrompt + "\n" + text : text;
+                systemPrompt = systemPrompt ? `${systemPrompt}\n${text}` : text;
             } else if (msg.role === "user") {
                 const contentText = textFromParts(msg.content);
-                if (contentText) {
-                    inputItems.push({ type: "message", role: "user", content: contentText });
-                }
+                if (contentText) inputItems.push({ type: "message", role: "user", content: contentText });
             } else if (msg.role === "assistant") {
                 const contentText = textFromParts(msg.content);
-                if (contentText) {
-                    inputItems.push({ type: "message", role: "assistant", content: contentText });
-                }
+                if (contentText) inputItems.push({ type: "message", role: "assistant", content: contentText });
                 if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
                     for (const tc of msg.tool_calls) {
                         inputItems.push({
                             type: "function_call",
                             call_id: tc.id,
                             name: tc.function?.name,
-                            arguments: tc.function?.arguments || "{}"
+                            arguments: tc.function?.arguments || "{}",
                         });
                     }
                 }
@@ -356,7 +344,7 @@ function transformRequestForGPT(openAIRequest) {
                 inputItems.push({
                     type: "function_call_output",
                     call_id: msg.tool_call_id,
-                    output: normalizeToolOutput(msg.content)
+                    output: normalizeToolOutput(msg.content),
                 });
             }
         }
@@ -372,34 +360,33 @@ function transformRequestForGPT(openAIRequest) {
                     inputItems.push({ type: "message", role: "user", content: item });
                     continue;
                 }
+
                 const itemRole = item.role || "";
-                const itemContent = typeof item.content === "string"
-                    ? item.content
-                    : textFromParts(item.content);
+                const itemContent = typeof item.content === "string" ? item.content : textFromParts(item.content);
 
                 if (itemRole === "system" || itemRole === "developer") {
                     if (itemContent) {
-                        systemPrompt = systemPrompt ? systemPrompt + "\n" + itemContent : itemContent;
+                        systemPrompt = systemPrompt ? `${systemPrompt}\n${itemContent}` : itemContent;
                     }
                     continue;
                 }
+
                 if ((item.type === "message" || item.role) && itemContent) {
                     inputItems.push({
                         type: "message",
                         role: itemRole === "assistant" ? "assistant" : "user",
-                        content: itemContent
+                        content: itemContent,
                     });
                 }
             }
         }
     }
 
-    // Safety: strip any system/developer items that leaked into input
-    inputItems = inputItems.filter(item => {
+    inputItems = inputItems.filter((item) => {
         if (item.type === "message" && (item.role === "system" || item.role === "developer")) {
             const text = typeof item.content === "string" ? item.content : textFromParts(item.content);
             if (text) {
-                systemPrompt = systemPrompt ? systemPrompt + "\n" + text : text;
+                systemPrompt = systemPrompt ? `${systemPrompt}\n${text}` : text;
             }
             return false;
         }
@@ -419,7 +406,7 @@ function transformRequestForGPT(openAIRequest) {
         gptRequest.instructions = systemPrompt;
         console.log("[GPT][TRANSFORM] System prompt extracted to instructions, length:", systemPrompt.length);
     } else {
-        console.warn("[GPT][TRANSFORM] WARNING: No system prompt found — model may not use tools");
+        console.warn("[GPT][TRANSFORM] WARNING: No system prompt found");
     }
 
     if (temperature !== undefined) gptRequest.temperature = temperature;
@@ -427,32 +414,31 @@ function transformRequestForGPT(openAIRequest) {
 
     if (tools && Array.isArray(tools) && tools.length > 0) {
         gptRequest.tools = tools
-            .filter(tool => tool && (tool.function?.name || tool.name))
-            .map(tool => {
+            .filter((tool) => tool && (tool.function?.name || tool.name))
+            .map((tool) => {
                 if (tool.type === "function" && tool.function) {
                     return {
                         type: "function",
                         name: tool.function.name,
                         description: tool.function.description || "",
                         parameters: tool.function.parameters || { type: "object", properties: {} },
-                        strict: false
+                        strict: false,
                     };
-                } else if (tool.name) {
+                }
+                if (tool.name) {
                     return {
                         type: "function",
                         name: tool.name,
                         description: tool.description || "",
                         parameters: tool.parameters || tool.input_schema || { type: "object", properties: {} },
-                        strict: false
+                        strict: false,
                     };
                 }
                 return null;
             })
             .filter(Boolean);
 
-        if (!tool_choice) {
-            gptRequest.tool_choice = "auto";
-        }
+        if (!tool_choice) gptRequest.tool_choice = "auto";
     }
 
     if (tool_choice) {
@@ -462,7 +448,7 @@ function transformRequestForGPT(openAIRequest) {
             gptRequest.tool_choice = "none";
         } else if (tool_choice === "required") {
             gptRequest.tool_choice = "required";
-        } else if (typeof tool_choice === "object" && tool_choice.function?.name) {
+        } else if (typeof tool_choice === "object" && tool_choice.function && tool_choice.function.name) {
             gptRequest.tool_choice = { type: "function", name: tool_choice.function.name };
         }
     }
@@ -476,41 +462,37 @@ function writeSSEFromChatCompletion(req, res, openAIResponse) {
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
 
-    const id = openAIResponse.id || "chatcmpl-" + Date.now();
+    const id = openAIResponse.id || `chatcmpl-${Date.now()}`;
     const created = openAIResponse.created || Math.floor(Date.now() / 1000);
-    const model = openAIResponse.model || req.body.model || CONFIG.AZURE_OPENAI_MODEL;
+    const model = openAIResponse.model || req.body.model || CONFIG.DEFAULT_GPT_MODEL;
     const message = openAIResponse.choices?.[0]?.message || {};
     const finishReason = openAIResponse.choices?.[0]?.finish_reason || "stop";
     const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
 
     const makeChunk = (delta, finish) => JSON.stringify({
-        id, object: "chat.completion.chunk", created, model,
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
         choices: [{ index: 0, delta, logprobs: null, finish_reason: finish }],
     });
 
     if (hasToolCalls) {
-        // Chunk 1: role + tool call headers (name, id, type) with empty arguments
         const toolHeaders = message.tool_calls.map((tc, idx) => ({
             index: idx,
             id: tc.id,
             type: "function",
-            function: { name: tc.function?.name || "", arguments: "" }
+            function: { name: tc.function?.name || "", arguments: "" },
         }));
         res.write(`data: ${makeChunk({ role: "assistant", content: null, tool_calls: toolHeaders }, null)}\n\n`);
 
-        // Chunk 2+: argument content for each tool call
         for (let idx = 0; idx < message.tool_calls.length; idx++) {
             const args = message.tool_calls[idx].function?.arguments || "{}";
             res.write(`data: ${makeChunk({ tool_calls: [{ index: idx, function: { arguments: args } }] }, null)}\n\n`);
         }
 
-        // Final chunk: finish_reason = "tool_calls"
         res.write(`data: ${makeChunk({}, "tool_calls")}\n\n`);
-
-        console.log("[GPT][SSE] Emitted", message.tool_calls.length, "tool call(s) via buffered SSE:",
-            message.tool_calls.map(tc => tc.function?.name).join(", "));
     } else {
-        // Text-only response
         const content = message.content || "";
         res.write(`data: ${makeChunk({ role: "assistant", content }, null)}\n\n`);
         res.write(`data: ${makeChunk({}, finishReason)}\n\n`);
@@ -524,7 +506,7 @@ function transformGPTResponse(gptResponse, publicModel) {
     const { id, output, usage } = gptResponse;
 
     const response = {
-        id: id || "chatcmpl-" + Date.now(),
+        id: id || `chatcmpl-${Date.now()}`,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: publicModel,
@@ -557,12 +539,12 @@ function transformGPTResponse(gptResponse, publicModel) {
                 }
             } else if (item.type === "function_call") {
                 toolCalls.push({
-                    id: item.call_id || item.id || "call_" + Date.now(),
+                    id: item.call_id || item.id || `call_${Date.now()}`,
                     type: "function",
                     function: {
                         name: item.name,
-                        arguments: item.arguments || "{}"
-                    }
+                        arguments: item.arguments || "{}",
+                    },
                 });
             }
         }
@@ -577,25 +559,23 @@ function transformGPTResponse(gptResponse, publicModel) {
     return response;
 }
 
-// ============================================================================
-// ENDPOINTS
-// ============================================================================
-
 app.get("/", (req, res) => {
     res.json({
         status: "running",
         name: "Azure Multi-Model Proxy (Claude + GPT)",
-        version: "4.1.0",
+        version: "5.3.0",
         endpoints: {
             health: "/health",
             chat_cursor: "/chat/completions",
             chat_openai: "/v1/chat/completions",
-            chat_anthropic: "/v1/messages"
+            chat_anthropic: "/v1/messages",
         },
         models: {
             claude: CONFIG.AZURE_ENDPOINT ? "configured" : "not configured",
-            gpt: CONFIG.AZURE_OPENAI_ENDPOINT ? "configured" : "not configured"
-        }
+            gpt53: CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT53 ? "configured" : "not configured",
+            gpt54: CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT54 ? "configured" : "not configured",
+            default_gpt_model: CONFIG.DEFAULT_GPT_MODEL,
+        },
     });
 });
 
@@ -605,7 +585,7 @@ app.get("/health", (req, res) => {
         timestamp: new Date().toISOString(),
         claude: !!CONFIG.AZURE_API_KEY,
         gpt: !!CONFIG.AZURE_OPENAI_API_KEY,
-        port: CONFIG.PORT
+        port: CONFIG.PORT,
     });
 });
 
@@ -623,7 +603,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
 
         const hasMessages = req.body.messages && Array.isArray(req.body.messages);
         if (!hasMessages && !req.body.content && !req.body.input) {
-            return res.status(400).json({ error: { message: "Invalid request: must include messages", type: "invalid_request_error" } });
+            return res.status(400).json({ error: { message: "Invalid request: must include messages, content, or input", type: "invalid_request_error" } });
         }
 
         if (req.body.messages) req.body.messages = fixImageTurns(req.body.messages);
@@ -637,11 +617,11 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
         console.error("[ERROR]", error.message);
         if (error.response) {
             return res.status(error.response.status).json({ error: { message: error.response.data?.error?.message || error.message, type: "api_error" } });
-        } else if (error.request) {
-            return res.status(503).json({ error: { message: "Unable to reach API", type: "connection_error" } });
-        } else {
-            return res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
         }
+        if (error.request) {
+            return res.status(503).json({ error: { message: "Unable to reach API", type: "connection_error" } });
+        }
+        return res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
     }
 });
 
@@ -658,10 +638,9 @@ async function handleClaudeRequest(req, res) {
     let anthropicRequest;
     try {
         anthropicRequest = transformRequestForClaude(req.body);
-        console.log("[CLAUDE] Model:", anthropicRequest.model, "Tools:", anthropicRequest.tools?.length || 0);
     } catch (transformError) {
         console.error("[ERROR] Transform failed:", transformError.message);
-        return res.status(400).json({ error: { message: "Transform error: " + transformError.message, type: "transform_error" } });
+        return res.status(400).json({ error: { message: `Transform error: ${transformError.message}`, type: "transform_error" } });
     }
 
     const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
@@ -675,8 +654,6 @@ async function handleClaudeRequest(req, res) {
         validateStatus: (status) => status < 600,
     });
 
-    console.log("[CLAUDE] Response status:", response.status);
-
     if (response.status >= 400) {
         let errorMessage = "Claude API error";
         if (response.data) {
@@ -687,7 +664,11 @@ async function handleClaudeRequest(req, res) {
                     response.data.on("end", resolve);
                     response.data.on("error", resolve);
                 });
-                try { errorMessage = JSON.parse(errorBuffer)?.error?.message || errorBuffer; } catch (e) { errorMessage = errorBuffer; }
+                try {
+                    errorMessage = JSON.parse(errorBuffer)?.error?.message || errorBuffer;
+                } catch (error) {
+                    errorMessage = errorBuffer;
+                }
             } else if (response.data.error) {
                 errorMessage = response.data.error.message;
             }
@@ -698,13 +679,7 @@ async function handleClaudeRequest(req, res) {
     if (isStreaming) {
         handleClaudeStreaming(req, res, response);
     } else {
-        try {
-            const openAIResponse = transformClaudeResponse(response.data);
-            res.json(openAIResponse);
-        } catch (transformError) {
-            console.error("[ERROR] Response transform failed:", transformError.message);
-            return res.status(500).json({ error: { message: "Transform error", type: "transform_error" } });
-        }
+        res.json(transformClaudeResponse(response.data));
     }
 }
 
@@ -739,10 +714,10 @@ function handleClaudeStreaming(req, res, response) {
 
                     if (event.content_block.type === "tool_use") {
                         const toolChunk = {
-                            id: "chatcmpl-" + Date.now(),
+                            id: `chatcmpl-${Date.now()}`,
                             object: "chat.completion.chunk",
                             created: Math.floor(Date.now() / 1000),
-                            model: req.body.model || "claude-opus-4-5",
+                            model: req.body.model || CONFIG.AZURE_DEPLOYMENT_NAME,
                             choices: [{
                                 index: 0,
                                 delta: {
@@ -750,8 +725,8 @@ function handleClaudeStreaming(req, res, response) {
                                         index: currentToolCallIndex,
                                         id: event.content_block.id,
                                         type: "function",
-                                        function: { name: event.content_block.name, arguments: "" }
-                                    }]
+                                        function: { name: event.content_block.name, arguments: "" },
+                                    }],
                                 },
                                 finish_reason: null,
                             }],
@@ -761,10 +736,10 @@ function handleClaudeStreaming(req, res, response) {
                 } else if (event.type === "content_block_delta") {
                     if (event.delta.type === "text_delta") {
                         const textChunk = {
-                            id: "chatcmpl-" + Date.now(),
+                            id: `chatcmpl-${Date.now()}`,
                             object: "chat.completion.chunk",
                             created: Math.floor(Date.now() / 1000),
-                            model: req.body.model || "claude-opus-4-5",
+                            model: req.body.model || CONFIG.AZURE_DEPLOYMENT_NAME,
                             choices: [{
                                 index: 0,
                                 delta: { content: event.delta.text || "" },
@@ -774,17 +749,17 @@ function handleClaudeStreaming(req, res, response) {
                         res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
                     } else if (event.delta.type === "input_json_delta") {
                         const toolChunk = {
-                            id: "chatcmpl-" + Date.now(),
+                            id: `chatcmpl-${Date.now()}`,
                             object: "chat.completion.chunk",
                             created: Math.floor(Date.now() / 1000),
-                            model: req.body.model || "claude-opus-4-5",
+                            model: req.body.model || CONFIG.AZURE_DEPLOYMENT_NAME,
                             choices: [{
                                 index: 0,
                                 delta: {
                                     tool_calls: [{
                                         index: currentToolCallIndex,
-                                        function: { arguments: event.delta.partial_json || "" }
-                                    }]
+                                        function: { arguments: event.delta.partial_json || "" },
+                                    }],
                                 },
                                 finish_reason: null,
                             }],
@@ -793,15 +768,15 @@ function handleClaudeStreaming(req, res, response) {
                     }
                 } else if (event.type === "content_block_stop") {
                     const idx = event.index;
-                    if (contentBlocks[idx]?.type === "tool_use") {
+                    if (contentBlocks[idx] && contentBlocks[idx].type === "tool_use") {
                         currentToolCallIndex++;
                     }
                 } else if (event.type === "message_stop") {
                     const stopChunk = {
-                        id: "chatcmpl-" + Date.now(),
+                        id: `chatcmpl-${Date.now()}`,
                         object: "chat.completion.chunk",
                         created: Math.floor(Date.now() / 1000),
-                        model: req.body.model || "claude-opus-4-5",
+                        model: req.body.model || CONFIG.AZURE_DEPLOYMENT_NAME,
                         choices: [{
                             index: 0,
                             delta: {},
@@ -811,14 +786,13 @@ function handleClaudeStreaming(req, res, response) {
                     res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
                     res.write("data: [DONE]\n\n");
                 }
-            } catch (e) {
-                console.error("[ERROR] Parse error:", e.message);
+            } catch (error) {
+                console.error("[ERROR] Parse error:", error.message);
             }
         }
     });
 
     response.data.on("end", () => {
-        console.log("[CLAUDE] Stream ended");
         res.end();
     });
 
@@ -838,24 +812,13 @@ async function handleGPTRequest(req, res) {
     const target = resolveGPTTarget(requestedModel);
 
     if (!CONFIG.AZURE_OPENAI_API_KEY) {
-        return res.status(500).json({
-            error: {
-                message: "GPT API key not configured (AZURE_OPENAI_API_KEY)",
-                type: "configuration_error"
-            }
-        });
+        return res.status(500).json({ error: { message: "GPT API key not configured (AZURE_OPENAI_API_KEY)", type: "configuration_error" } });
     }
-
     if (!target.endpoint) {
-        return res.status(500).json({
-            error: {
-                message: "GPT endpoint not configured",
-                type: "configuration_error"
-            }
-        });
+        return res.status(500).json({ error: { message: "GPT endpoint not configured", type: "configuration_error" } });
     }
 
-    const isStreaming = req.body.stream === true;
+    const wantsStream = req.body.stream === true;
 
     let forwardBody;
     try {
@@ -863,23 +826,17 @@ async function handleGPTRequest(req, res) {
         forwardBody.model = target.deployment;
     } catch (transformError) {
         console.error("[GPT][TRANSFORM] Error:", transformError.message);
-        return res.status(400).json({
-            error: {
-                message: "Transform error: " + transformError.message,
-                type: "transform_error"
-            }
-        });
+        return res.status(400).json({ error: { message: `Transform error: ${transformError.message}`, type: "transform_error" } });
     }
 
-    console.log(
-        "[GPT][PIPE]",
-        requestId,
-        "Requested:", requestedModel || "(missing)",
-        "Public:", target.publicModel,
-        "Deployment:", target.deployment,
-        "Stream:", isStreaming,
-        "Tools:", forwardBody.tools?.length || 0
-    );
+    const hasTools = Array.isArray(forwardBody.tools) && forwardBody.tools.length > 0;
+    const useBufferedToolMode = wantsStream && hasTools;
+
+    if (useBufferedToolMode) {
+        forwardBody.stream = false;
+    }
+
+    console.log("[GPT][PIPE]", requestId, "Requested:", requestedModel || "(missing)", "Public:", target.publicModel, "Deployment:", target.deployment, "Stream:", wantsStream, "Tools:", forwardBody.tools?.length || 0, "BufferedToolMode:", useBufferedToolMode);
 
     try {
         const response = await axios.post(target.endpoint, forwardBody, {
@@ -889,32 +846,38 @@ async function handleGPTRequest(req, res) {
                 "api-key": CONFIG.AZURE_OPENAI_API_KEY,
             },
             timeout: 300000,
-            responseType: isStreaming ? "stream" : "json",
+            responseType: useBufferedToolMode ? "json" : (wantsStream ? "stream" : "json"),
             validateStatus: (status) => status < 600,
         });
-
-        console.log("[GPT][PIPE]", requestId, "Response status:", response.status);
 
         if (response.status >= 400) {
             let errorMessage = "GPT API error";
             if (response.data) {
-                if (isStreaming && typeof response.data.pipe === "function") {
+                if (!useBufferedToolMode && wantsStream && typeof response.data.pipe === "function") {
                     let errorBuffer = "";
                     await new Promise((resolve) => {
                         response.data.on("data", (chunk) => { errorBuffer += chunk.toString(); });
                         response.data.on("end", resolve);
                         response.data.on("error", resolve);
                     });
-                    try { errorMessage = JSON.parse(errorBuffer)?.error?.message || errorBuffer; } catch (e) { errorMessage = errorBuffer; }
+                    try {
+                        errorMessage = JSON.parse(errorBuffer)?.error?.message || errorBuffer;
+                    } catch (error) {
+                        errorMessage = errorBuffer;
+                    }
                 } else if (response.data.error) {
                     errorMessage = typeof response.data.error === "string" ? response.data.error : response.data.error.message;
                 }
             }
-            console.error("[GPT][PIPE] Error:", errorMessage);
             return res.status(response.status).json({ error: { message: errorMessage, type: "api_error" } });
         }
 
-        if (isStreaming) {
+        if (useBufferedToolMode) {
+            const openAIResponse = transformGPTResponse(response.data, target.publicModel);
+            return writeSSEFromChatCompletion(req, res, openAIResponse);
+        }
+
+        if (wantsStream) {
             res.setHeader("Content-Type", "text/event-stream");
             res.setHeader("Cache-Control", "no-cache");
             res.setHeader("Connection", "keep-alive");
@@ -924,16 +887,15 @@ async function handleGPTRequest(req, res) {
             let sseBuffer = "";
             const chatId = `chatcmpl-${requestId}`;
             const chatCreated = Math.floor(Date.now() / 1000);
-            let toolIdx = 0;
-            const toolMap = {};
-            let hasTools = false;
             let roleSent = false;
 
             function chatChunk(delta, finish) {
                 return JSON.stringify({
-                    id: chatId, object: "chat.completion.chunk", created: chatCreated,
+                    id: chatId,
+                    object: "chat.completion.chunk",
+                    created: chatCreated,
                     model: target.publicModel,
-                    choices: [{ index: 0, delta, finish_reason: finish || null }]
+                    choices: [{ index: 0, delta, finish_reason: finish || null }],
                 });
             }
 
@@ -945,25 +907,23 @@ async function handleGPTRequest(req, res) {
 
                     for (const part of parts) {
                         if (!part.trim()) continue;
-                        let etype = null, edata = null;
+                        let etype = null;
+                        let edata = null;
                         for (const line of part.split("\n")) {
                             if (line.startsWith("event: ")) etype = line.slice(7).trim();
                             else if (line.startsWith("data: ")) edata = line.slice(6);
                         }
                         if (!edata) continue;
 
-                        let p;
-                        try { p = JSON.parse(edata); } catch { continue; }
-
-                        console.log("[GPT][EVT]", requestId, etype);
+                        let payload;
+                        try {
+                            payload = JSON.parse(edata);
+                        } catch (error) {
+                            continue;
+                        }
 
                         if (etype === "error" || etype === "response.failed") {
-                            const errDetail = p.error?.message
-                                || p.response?.error?.message
-                                || p.response?.status
-                                || "unknown";
-                            console.error("[GPT][ERROR]", requestId, "type:", etype, "detail:", errDetail);
-                            console.error("[GPT][ERROR-FULL]", requestId, JSON.stringify(p).slice(0, 500));
+                            const errDetail = payload.error?.message || payload.response?.error?.message || payload.response?.status || "unknown";
                             if (!roleSent) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
                                 roleSent = true;
@@ -984,34 +944,17 @@ async function handleGPTRequest(req, res) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
                                 roleSent = true;
                             }
-                            this.push(`data: ${chatChunk({ content: p.delta || "" })}\n\n`);
-                        } else if (etype === "response.output_item.added" && (p.item?.type === "function_call" || p.item?.type === "custom_tool_call")) {
-                            hasTools = true;
-                            const callId = p.item.call_id || p.item.id;
-                            const idx = toolIdx++;
-                            toolMap[callId] = idx;
-                            if (!roleSent) {
-                                this.push(`data: ${chatChunk({ role: "assistant", content: null })}\n\n`);
-                                roleSent = true;
-                            }
-                            console.log("[GPT][TOOL]", requestId, "type:", p.item.type, "index:", idx, "name:", p.item.name, "call_id:", callId);
-                            this.push(`data: ${chatChunk({
-                                tool_calls: [{ index: idx, id: callId, type: "function", function: { name: p.item.name || "", arguments: "" } }]
-                            })}\n\n`);
-                        } else if (etype === "response.function_call_arguments.delta" || etype === "response.custom_tool_call_input.delta") {
-                            const callId = p.call_id || p.item_id;
-                            const idx = toolMap[callId] ?? 0;
-                            this.push(`data: ${chatChunk({
-                                tool_calls: [{ index: idx, function: { arguments: p.delta || "" } }]
-                            })}\n\n`);
+                            this.push(`data: ${chatChunk({ content: payload.delta || "" })}\n\n`);
                         } else if (etype === "response.completed") {
-                            this.push(`data: ${chatChunk({}, hasTools ? "tool_calls" : "stop")}\n\n`);
+                            this.push(`data: ${chatChunk({}, "stop")}\n\n`);
                             this.push("data: [DONE]\n\n");
                         }
                     }
                     cb();
                 },
-                flush(cb) { cb(); }
+                flush(cb) {
+                    cb();
+                },
             });
 
             response.data.pipe(transformer).pipe(res);
@@ -1033,7 +976,6 @@ app.post("/v1/chat/completions", requireAuth, (req, res) => {
 });
 
 app.post("/v1/messages", requireAuth, async (req, res) => {
-    console.log("[REQUEST /v1/messages]", new Date().toISOString());
     try {
         if (!CONFIG.AZURE_API_KEY) {
             return res.status(500).json({ error: { message: "Claude API key not configured", type: "configuration_error" } });
@@ -1069,16 +1011,18 @@ app.use((req, res) => {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
-    console.log("Azure Multi-Model Proxy v5.1 - Claude + GPT (Direct Pipe)");
+    console.log("Azure Multi-Model Proxy Reference v5.3");
     console.log("=".repeat(60));
     console.log(`Server: 0.0.0.0:${CONFIG.PORT}`);
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
     console.log(`GPT: ${CONFIG.AZURE_OPENAI_API_KEY ? "Configured" : "MISSING"}`);
-    console.log(`GPT Endpoint: ${CONFIG.AZURE_OPENAI_ENDPOINT}`);
-    console.log(`Default GPT Model: ${CONFIG.DEFAULT_GPT_MODEL}`);
-    console.log(`Endpoints: /chat/completions, /v1/chat/completions, /v1/messages`);
+    console.log(`Default GPT: ${CONFIG.DEFAULT_GPT_MODEL}`);
+    console.log(`GPT-5.3 deployment: ${CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT53}`);
+    console.log(`GPT-5.4 deployment: ${CONFIG.AZURE_OPENAI_DEPLOYMENT_GPT54}`);
+    console.log("Endpoints: /chat/completions, /v1/chat/completions, /v1/messages");
     console.log("=".repeat(60));
 });
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+
