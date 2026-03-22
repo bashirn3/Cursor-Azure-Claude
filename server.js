@@ -1,4 +1,5 @@
 
+
 const express = require("express");
 const axios = require("axios");
 
@@ -809,6 +810,8 @@ async function handleGPTRequest(req, res) {
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const requestedModel = req.body?.model || "";
     const target = resolveGPTTarget(requestedModel);
+    const axiosTimeout = 300000;
+    const startedAt = Date.now();
 
     if (!CONFIG.AZURE_OPENAI_API_KEY) {
         return res.status(500).json({ error: { message: "GPT API key not configured (AZURE_OPENAI_API_KEY)", type: "configuration_error" } });
@@ -836,6 +839,31 @@ async function handleGPTRequest(req, res) {
     }
 
     console.log("[GPT][PIPE]", requestId, "Requested:", requestedModel || "(missing)", "Public:", target.publicModel, "Deployment:", target.deployment, "Stream:", wantsStream, "Tools:", forwardBody.tools?.length || 0, "BufferedToolMode:", useBufferedToolMode);
+    console.log("[GPT][MODE]", requestId, JSON.stringify({
+        requestedModel: requestedModel || null,
+        publicModel: target.publicModel,
+        deployment: target.deployment,
+        wantsStream,
+        hasTools,
+        bufferedToolMode: useBufferedToolMode,
+    }));
+    console.log("[GPT][AZURE-REQ]", requestId, JSON.stringify({
+        endpoint: target.endpoint,
+        deployment: target.deployment,
+        publicModel: target.publicModel,
+        body: {
+            model: forwardBody.model,
+            stream: forwardBody.stream,
+            inputCount: Array.isArray(forwardBody.input) ? forwardBody.input.length : 0,
+            toolCount: Array.isArray(forwardBody.tools) ? forwardBody.tools.length : 0,
+            hasInstructions: !!forwardBody.instructions,
+            instructionsLength: forwardBody.instructions?.length || 0,
+            toolChoice: forwardBody.tool_choice || null,
+            maxOutputTokens: forwardBody.max_output_tokens || null,
+        },
+    }));
+    console.log("[GPT][AZURE-TIMEOUT]", requestId, axiosTimeout);
+    console.log("[GPT][AZURE-REQ-START]", requestId, new Date(startedAt).toISOString());
 
     try {
         const response = await axios.post(target.endpoint, forwardBody, {
@@ -844,10 +872,24 @@ async function handleGPTRequest(req, res) {
                 "Authorization": `Bearer ${CONFIG.AZURE_OPENAI_API_KEY}`,
                 "api-key": CONFIG.AZURE_OPENAI_API_KEY,
             },
-            timeout: 300000,
+            timeout: axiosTimeout,
             responseType: useBufferedToolMode ? "json" : (wantsStream ? "stream" : "json"),
             validateStatus: (status) => status < 600,
         });
+
+        console.log("[GPT][AZURE-REQ-END]", requestId, JSON.stringify({
+            elapsedMs: Date.now() - startedAt,
+            status: response.status,
+        }));
+        console.log("[GPT][PIPE]", requestId, "Response status:", response.status);
+
+        if (!wantsStream || useBufferedToolMode) {
+            console.log("[GPT][AZURE-RESP-SHAPE]", requestId, JSON.stringify({
+                hasOutput: Array.isArray(response.data?.output),
+                outputLength: Array.isArray(response.data?.output) ? response.data.output.length : 0,
+                usage: response.data?.usage || null,
+            }));
+        }
 
         if (response.status >= 400) {
             let errorMessage = "GPT API error";
@@ -961,7 +1003,21 @@ async function handleGPTRequest(req, res) {
             res.json(transformGPTResponse(response.data, target.publicModel));
         }
     } catch (error) {
-        console.error("[GPT][PIPE] Error:", error.message);
+        console.error("[GPT][PIPE][FAIL]", requestId, JSON.stringify({
+            message: error.message,
+            code: error.code || null,
+            errno: error.errno || null,
+            syscall: error.syscall || null,
+            address: error.address || null,
+            port: error.port || null,
+            timeout: error.timeout || null,
+            elapsedMs: Date.now() - startedAt,
+            status: error.response?.status || null,
+            statusText: error.response?.statusText || null,
+            responseData: typeof error.response?.data === "string"
+                ? error.response.data.slice(0, 2000)
+                : (error.response?.data || null),
+        }));
         if (error.response) {
             return res.status(error.response.status).json(error.response.data || { error: { message: error.message, type: "api_error" } });
         }
