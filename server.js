@@ -978,6 +978,9 @@ async function handleGPTRequest(req, res) {
             const chatId = `chatcmpl-${requestId}`;
             const chatCreated = Math.floor(Date.now() / 1000);
             let roleSent = false;
+            let toolIdx = 0;
+            const toolMap = {};
+            let hasToolCallsInStream = false;
 
             function chatChunk(delta, finish) {
                 return JSON.stringify({
@@ -1029,6 +1032,53 @@ async function handleGPTRequest(req, res) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
                                 roleSent = true;
                             }
+                        } else if (
+                            etype === "response.output_item.added" &&
+                            (payload.item?.type === "function_call" || payload.item?.type === "custom_tool_call")
+                        ) {
+                            hasToolCallsInStream = true;
+                            const callId = payload.item.call_id || payload.item.id;
+                            const idx = toolIdx++;
+                            toolMap[callId] = idx;
+
+                            if (!roleSent) {
+                                this.push(`data: ${chatChunk({ role: "assistant", content: null })}\n\n`);
+                                roleSent = true;
+                            }
+
+                            console.log("[GPT][STREAM-TOOL]", requestId, JSON.stringify({
+                                type: payload.item.type,
+                                index: idx,
+                                callId,
+                                name: payload.item.name || null,
+                            }));
+
+                            this.push(`data: ${chatChunk({
+                                tool_calls: [{
+                                    index: idx,
+                                    id: callId,
+                                    type: "function",
+                                    function: { name: payload.item.name || "", arguments: "" },
+                                }],
+                            })}\n\n`);
+                        } else if (
+                            etype === "response.function_call_arguments.delta" ||
+                            etype === "response.custom_tool_call_input.delta"
+                        ) {
+                            const callId = payload.call_id || payload.item_id;
+                            const idx = toolMap[callId] ?? 0;
+
+                            if (!roleSent) {
+                                this.push(`data: ${chatChunk({ role: "assistant", content: null })}\n\n`);
+                                roleSent = true;
+                            }
+
+                            this.push(`data: ${chatChunk({
+                                tool_calls: [{
+                                    index: idx,
+                                    function: { arguments: payload.delta || "" },
+                                }],
+                            })}\n\n`);
                         } else if (etype === "response.output_text.delta") {
                             if (!roleSent) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
@@ -1036,7 +1086,7 @@ async function handleGPTRequest(req, res) {
                             }
                             this.push(`data: ${chatChunk({ content: payload.delta || "" })}\n\n`);
                         } else if (etype === "response.completed") {
-                            this.push(`data: ${chatChunk({}, "stop")}\n\n`);
+                            this.push(`data: ${chatChunk({}, hasToolCallsInStream ? "tool_calls" : "stop")}\n\n`);
                             this.push("data: [DONE]\n\n");
                         }
                     }
