@@ -843,8 +843,7 @@ async function handleGPTRequest(req, res) {
 
     if (
         target.publicModel === "gpt-5.3-codex" &&
-        hasTools &&
-        !forwardBody.tool_choice
+        hasTools
     ) {
         forwardBody.tool_choice = "required";
     }
