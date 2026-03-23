@@ -469,6 +469,14 @@ function writeSSEFromChatCompletion(req, res, openAIResponse) {
     const finishReason = openAIResponse.choices?.[0]?.finish_reason || "stop";
     const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
 
+    console.log("[GPT][SSE-EMIT]", JSON.stringify({
+        model,
+        finishReason,
+        hasToolCalls,
+        contentLength: typeof message.content === "string" ? message.content.length : 0,
+        toolCallCount: Array.isArray(message.tool_calls) ? message.tool_calls.length : 0,
+    }));
+
     const makeChunk = (delta, finish) => JSON.stringify({
         id,
         object: "chat.completion.chunk",
@@ -832,7 +840,19 @@ async function handleGPTRequest(req, res) {
     }
 
     const hasTools = Array.isArray(forwardBody.tools) && forwardBody.tools.length > 0;
-    const useBufferedToolMode = wantsStream && hasTools;
+
+    if (
+        target.publicModel === "gpt-5.3-codex" &&
+        hasTools &&
+        !forwardBody.tool_choice
+    ) {
+        forwardBody.tool_choice = "required";
+    }
+
+    const useBufferedToolMode =
+        wantsStream &&
+        hasTools &&
+        target.publicModel === "gpt-5.4";
 
     if (useBufferedToolMode) {
         forwardBody.stream = false;
@@ -889,6 +909,20 @@ async function handleGPTRequest(req, res) {
                 outputLength: Array.isArray(response.data?.output) ? response.data.output.length : 0,
                 usage: response.data?.usage || null,
             }));
+            console.log("[GPT][AZURE-OUTPUT-ITEMS]", requestId, JSON.stringify(
+                Array.isArray(response.data?.output)
+                    ? response.data.output.map((item) => ({
+                        type: item.type || null,
+                        id: item.id || null,
+                        call_id: item.call_id || null,
+                        name: item.name || null,
+                        role: item.role || null,
+                        contentTypes: Array.isArray(item.content)
+                            ? item.content.map((c) => c.type || null)
+                            : null,
+                    }))
+                    : []
+            ));
         }
 
         if (response.status >= 400) {
@@ -915,6 +949,21 @@ async function handleGPTRequest(req, res) {
 
         if (useBufferedToolMode) {
             const openAIResponse = transformGPTResponse(response.data, target.publicModel);
+            console.log("[GPT][OPENAI-RESP]", requestId, JSON.stringify({
+                model: openAIResponse.model,
+                finish_reason: openAIResponse.choices?.[0]?.finish_reason || null,
+                contentLength: openAIResponse.choices?.[0]?.message?.content?.length || 0,
+                toolCallCount: Array.isArray(openAIResponse.choices?.[0]?.message?.tool_calls)
+                    ? openAIResponse.choices[0].message.tool_calls.length
+                    : 0,
+                toolCalls: Array.isArray(openAIResponse.choices?.[0]?.message?.tool_calls)
+                    ? openAIResponse.choices[0].message.tool_calls.map((tc) => ({
+                        id: tc.id,
+                        name: tc.function?.name || null,
+                        argsLength: tc.function?.arguments?.length || 0,
+                    }))
+                    : [],
+            }));
             return writeSSEFromChatCompletion(req, res, openAIResponse);
         }
 
