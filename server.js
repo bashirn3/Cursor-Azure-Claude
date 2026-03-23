@@ -1,4 +1,5 @@
 
+
 const express = require("express");
 const axios = require("axios");
 
@@ -840,13 +841,6 @@ async function handleGPTRequest(req, res) {
 
     const hasTools = Array.isArray(forwardBody.tools) && forwardBody.tools.length > 0;
 
-    if (
-        target.publicModel === "gpt-5.3-codex" &&
-        hasTools
-    ) {
-        forwardBody.tool_choice = "required";
-    }
-
     const useBufferedToolMode =
         wantsStream &&
         hasTools &&
@@ -1211,5 +1205,3 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
-
-
