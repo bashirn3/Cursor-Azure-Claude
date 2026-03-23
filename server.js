@@ -1,5 +1,4 @@
 
-
 const express = require("express");
 const axios = require("axios");
 
@@ -980,6 +979,7 @@ async function handleGPTRequest(req, res) {
             let toolIdx = 0;
             const toolMap = {};
             let hasToolCallsInStream = false;
+            const toolArgBuffers = {};
 
             function chatChunk(delta, finish) {
                 return JSON.stringify({
@@ -1066,6 +1066,8 @@ async function handleGPTRequest(req, res) {
                         ) {
                             const callId = payload.call_id || payload.item_id;
                             const idx = toolMap[callId] ?? 0;
+                            const argDelta = payload.delta || "";
+                            toolArgBuffers[callId] = (toolArgBuffers[callId] || "") + argDelta;
 
                             if (!roleSent) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: null })}\n\n`);
@@ -1075,7 +1077,38 @@ async function handleGPTRequest(req, res) {
                             this.push(`data: ${chatChunk({
                                 tool_calls: [{
                                     index: idx,
-                                    function: { arguments: payload.delta || "" },
+                                    function: { arguments: argDelta },
+                                }],
+                            })}\n\n`);
+                        } else if (
+                            etype === "response.function_call_arguments.done" ||
+                            etype === "response.custom_tool_call_input.done"
+                        ) {
+                            const callId = payload.call_id || payload.item_id;
+                            const idx = toolMap[callId] ?? 0;
+                            const finalArgs = payload.arguments || payload.input || "";
+                            const bufferedArgs = toolArgBuffers[callId] || "";
+
+                            console.log("[GPT][STREAM-ARG-DONE]", requestId, JSON.stringify({
+                                callId,
+                                index: idx,
+                                bufferedLen: bufferedArgs.length,
+                                finalLen: finalArgs.length,
+                            }));
+
+                            if (!finalArgs || bufferedArgs) {
+                                continue;
+                            }
+
+                            if (!roleSent) {
+                                this.push(`data: ${chatChunk({ role: "assistant", content: null })}\n\n`);
+                                roleSent = true;
+                            }
+
+                            this.push(`data: ${chatChunk({
+                                tool_calls: [{
+                                    index: idx,
+                                    function: { arguments: finalArgs },
                                 }],
                             })}\n\n`);
                         } else if (etype === "response.output_text.delta") {
@@ -1178,4 +1211,5 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
 
 process.on("SIGTERM", () => { server.close(() => process.exit(0)); });
 process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+
 
