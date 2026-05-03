@@ -276,11 +276,6 @@ function transformRequestForGPT(openAIRequest) {
                 const hasToolCalls = msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
 
                 if (hasToolCalls) {
-                    // CRITICAL FIX: Do NOT emit a separate text message before function_calls.
-                    // The Responses API treats each message item as a complete turn.
-                    // Emitting text + function_call as separate items makes the model
-                    // think the text was a final response and the function_call is orphaned,
-                    // causing it to re-issue the same tool call in a loop.
                     for (const tc of msg.tool_calls) {
                         inputItems.push({
                             type: "function_call",
@@ -337,6 +332,30 @@ function transformRequestForGPT(openAIRequest) {
         }
         return true;
     });
+
+    // Remove empty/null-content messages that confuse the model
+    inputItems = inputItems.filter(item => {
+        if (item.type === "message") {
+            return item.content !== null && item.content !== undefined && item.content !== "";
+        }
+        return true;
+    });
+
+    // Merge consecutive assistant messages — Responses API treats each as a separate turn
+    // and back-to-back assistant messages break the conversation flow
+    const merged = [];
+    for (const item of inputItems) {
+        const prev = merged[merged.length - 1];
+        if (
+            item.type === "message" && prev?.type === "message" &&
+            item.role === prev.role && item.role === "assistant"
+        ) {
+            prev.content = (prev.content || "") + "\n" + (item.content || "");
+        } else {
+            merged.push(item);
+        }
+    }
+    inputItems = merged;
 
     if (inputItems.length === 0) {
         throw new Error("No usable input/messages for GPT request");
@@ -467,7 +486,7 @@ app.get("/", (req, res) => {
     res.json({
         status: "running",
         name: "Azure Multi-Model Proxy (Claude + GPT)",
-        version: "5.4.0",
+        version: "5.5.0",
         endpoints: {
             health: "/health",
             chat_cursor: "/chat/completions",
@@ -753,9 +772,12 @@ async function handleGPTRequest(req, res) {
         "Reasoning:", !!forwardBody.reasoning,
         "tool_choice:", forwardBody.tool_choice || "(none)");
 
-    // Log last few input items for debugging tool-call loops
-    const lastItems = forwardBody.input.slice(-4);
-    console.log("[GPT][INPUT-TAIL]", requestId, JSON.stringify(lastItems.map(i => ({ type: i.type, role: i.role, call_id: i.call_id, name: i.name, output_len: i.output?.length }))));
+    const typeSummary = forwardBody.input.map(i =>
+        i.type === "message" ? `msg:${i.role}` :
+        i.type === "function_call" ? `fc:${i.name}` :
+        `fc_out:${(i.call_id || "").slice(-8)}`
+    );
+    console.log("[GPT][INPUT-SHAPE]", requestId, `(${inputCount} items)`, typeSummary.join(" → "));
 
     try {
         const response = await axios.post(endpoint, forwardBody, {
@@ -972,7 +994,7 @@ app.use((req, res) => {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
-    console.log("Azure Multi-Model Proxy v5.4 - Loop Fix (tool-call history)");
+    console.log("Azure Multi-Model Proxy v5.5 - Loop Fix (merge + shape log)");
     console.log("=".repeat(60));
     console.log(`Server: 0.0.0.0:${CONFIG.PORT}`);
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
