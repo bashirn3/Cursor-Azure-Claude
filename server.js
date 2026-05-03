@@ -905,7 +905,6 @@ async function handleGPTRequest(req, res) {
                             // Reasoning summaries — silently consumed
                         } else if (etype === "response.output_item.added" && (p.item?.type === "function_call" || p.item?.type === "custom_tool_call")) {
                             if (!hasTools) {
-                                // First tool call — discard any buffered text
                                 if (textBuffer) {
                                     console.log("[GPT][BUFFER]", requestId, "Discarding", textBuffer.length, "chars of text (tool call takes priority)");
                                     textBuffer = "";
@@ -916,14 +915,15 @@ async function handleGPTRequest(req, res) {
                             const callId = p.item.call_id || p.item.id;
                             const idx = toolIdx++;
                             toolMap[callId] = idx;
-                            if (!roleSent) {
-                                this.push(`data: ${chatChunk({ role: "assistant", content: null })}\n\n`);
-                                roleSent = true;
-                            }
+                            const tcEntry = { index: idx, id: callId, type: "function", function: { name: p.item.name || "", arguments: "" } };
                             console.log("[GPT][TOOL]", requestId, "type:", p.item.type, "index:", idx, "name:", p.item.name, "call_id:", callId);
-                            this.push(`data: ${chatChunk({
-                                tool_calls: [{ index: idx, id: callId, type: "function", function: { name: p.item.name || "", arguments: "" } }]
-                            })}\n\n`);
+                            if (!roleSent) {
+                                // Cursor requires role + tool_calls in the SAME first delta
+                                this.push(`data: ${chatChunk({ role: "assistant", content: null, tool_calls: [tcEntry] })}\n\n`);
+                                roleSent = true;
+                            } else {
+                                this.push(`data: ${chatChunk({ tool_calls: [tcEntry] })}\n\n`);
+                            }
                         } else if (etype === "response.function_call_arguments.delta" || etype === "response.custom_tool_call_input.delta") {
                             const callId = p.call_id || p.item_id;
                             const idx = toolMap[callId] ?? 0;
@@ -1012,7 +1012,7 @@ app.use((req, res) => {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
-    console.log("Azure Multi-Model Proxy v5.6 - Buffer text, suppress when tools present");
+    console.log("Azure Multi-Model Proxy v5.7 - Merged role+tool_calls in first delta");
     console.log("=".repeat(60));
     console.log(`Server: 0.0.0.0:${CONFIG.PORT}`);
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
