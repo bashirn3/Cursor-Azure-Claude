@@ -273,8 +273,14 @@ function transformRequestForGPT(openAIRequest) {
                 if (contentText) inputItems.push({ type: "message", role: "user", content: contentText });
             } else if (msg.role === "assistant") {
                 const contentText = textFromParts(msg.content);
-                if (contentText) inputItems.push({ type: "message", role: "assistant", content: contentText });
-                if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+                const hasToolCalls = msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+
+                if (hasToolCalls) {
+                    // CRITICAL FIX: Do NOT emit a separate text message before function_calls.
+                    // The Responses API treats each message item as a complete turn.
+                    // Emitting text + function_call as separate items makes the model
+                    // think the text was a final response and the function_call is orphaned,
+                    // causing it to re-issue the same tool call in a loop.
                     for (const tc of msg.tool_calls) {
                         inputItems.push({
                             type: "function_call",
@@ -283,6 +289,8 @@ function transformRequestForGPT(openAIRequest) {
                             arguments: tc.function?.arguments || "{}"
                         });
                     }
+                } else if (contentText) {
+                    inputItems.push({ type: "message", role: "assistant", content: contentText });
                 }
             } else if (msg.role === "tool" || msg.role === "function") {
                 inputItems.push({
@@ -459,7 +467,7 @@ app.get("/", (req, res) => {
     res.json({
         status: "running",
         name: "Azure Multi-Model Proxy (Claude + GPT)",
-        version: "5.3.0",
+        version: "5.4.0",
         endpoints: {
             health: "/health",
             chat_cursor: "/chat/completions",
@@ -695,6 +703,7 @@ function handleClaudeStreaming(req, res, response) {
         }
         res.end();
     });
+
     response.data.on("error", (error) => {
         console.error("[ERROR] Stream error:", error.message);
         if (!doneSent) {
@@ -743,6 +752,10 @@ async function handleGPTRequest(req, res) {
         "Stream:", isStreaming,
         "Reasoning:", !!forwardBody.reasoning,
         "tool_choice:", forwardBody.tool_choice || "(none)");
+
+    // Log last few input items for debugging tool-call loops
+    const lastItems = forwardBody.input.slice(-4);
+    console.log("[GPT][INPUT-TAIL]", requestId, JSON.stringify(lastItems.map(i => ({ type: i.type, role: i.role, call_id: i.call_id, name: i.name, output_len: i.output?.length }))));
 
     try {
         const response = await axios.post(endpoint, forwardBody, {
@@ -833,7 +846,6 @@ async function handleGPTRequest(req, res) {
                         if (etype === "error" || etype === "response.failed") {
                             const errDetail = p.error?.message || p.response?.error?.message || p.response?.status || "unknown";
                             console.error("[GPT][ERROR]", requestId, "type:", etype, "detail:", errDetail);
-                            console.error("[GPT][ERROR-FULL]", requestId, JSON.stringify(p).slice(0, 500));
                             if (!roleSent) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
                                 roleSent = true;
@@ -891,7 +903,7 @@ async function handleGPTRequest(req, res) {
                 },
                 flush(cb) {
                     if (!doneSent) {
-                        console.warn("[GPT][FLUSH]", requestId, "Stream ended without response.completed — forcing [DONE]");
+                        console.warn("[GPT][FLUSH]", requestId, "Stream ended without completion event — forcing [DONE]");
                         sendDone(this);
                     }
                     cb();
@@ -960,7 +972,7 @@ app.use((req, res) => {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
-    console.log("Azure Multi-Model Proxy v5.3 - Claude + GPT (Loop-Fix)");
+    console.log("Azure Multi-Model Proxy v5.4 - Loop Fix (tool-call history)");
     console.log("=".repeat(60));
     console.log(`Server: 0.0.0.0:${CONFIG.PORT}`);
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
