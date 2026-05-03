@@ -827,6 +827,8 @@ async function handleGPTRequest(req, res) {
             let hasTools = false;
             let roleSent = false;
             let doneSent = false;
+            let textBuffer = "";
+            let textFlushed = false;
 
             function chatChunk(delta, finish) {
                 return JSON.stringify({
@@ -836,9 +838,21 @@ async function handleGPTRequest(req, res) {
                 });
             }
 
+            function flushText(self) {
+                if (textFlushed || !textBuffer) return;
+                textFlushed = true;
+                if (!roleSent) {
+                    self.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
+                    roleSent = true;
+                }
+                self.push(`data: ${chatChunk({ content: textBuffer })}\n\n`);
+                textBuffer = "";
+            }
+
             function sendDone(self) {
                 if (doneSent) return;
                 doneSent = true;
+                if (!hasTools) flushText(self);
                 if (!roleSent) {
                     self.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
                     roleSent = true;
@@ -878,22 +892,26 @@ async function handleGPTRequest(req, res) {
                         }
 
                         if (etype === "response.created" || etype === "response.in_progress") {
-                            if (!roleSent) {
-                                this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
-                                roleSent = true;
-                            }
+                            // Don't send role yet — wait to see if tools arrive
                         } else if (etype === "response.output_text.delta") {
-                            if (!roleSent) {
-                                this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
-                                roleSent = true;
+                            if (hasTools) {
+                                // Already in tool-call mode — drop text so Cursor
+                                // doesn't see mixed content + tool_calls
+                                continue;
                             }
-                            this.push(`data: ${chatChunk({ content: p.delta || "" })}\n\n`);
+                            // Buffer text; only flush on completion if no tools
+                            textBuffer += (p.delta || "");
                         } else if (etype === "response.reasoning_summary_text.delta") {
-                            if (!roleSent) {
-                                this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
-                                roleSent = true;
-                            }
+                            // Reasoning summaries — silently consumed
                         } else if (etype === "response.output_item.added" && (p.item?.type === "function_call" || p.item?.type === "custom_tool_call")) {
+                            if (!hasTools) {
+                                // First tool call — discard any buffered text
+                                if (textBuffer) {
+                                    console.log("[GPT][BUFFER]", requestId, "Discarding", textBuffer.length, "chars of text (tool call takes priority)");
+                                    textBuffer = "";
+                                }
+                                textFlushed = true;
+                            }
                             hasTools = true;
                             const callId = p.item.call_id || p.item.id;
                             const idx = toolIdx++;
@@ -913,7 +931,7 @@ async function handleGPTRequest(req, res) {
                                 tool_calls: [{ index: idx, function: { arguments: p.delta || "" } }]
                             })}\n\n`);
                         } else if (etype === "response.completed") {
-                            console.log("[GPT][COMPLETED]", requestId, "status:", p.response?.status);
+                            console.log("[GPT][COMPLETED]", requestId, "status:", p.response?.status, "hasTools:", hasTools, "bufferedText:", textBuffer.length);
                             sendDone(this);
                         } else if (etype === "response.incomplete") {
                             const reason = p.response?.incomplete_details?.reason || "unknown";
@@ -994,7 +1012,7 @@ app.use((req, res) => {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
-    console.log("Azure Multi-Model Proxy v5.5 - Loop Fix (merge + shape log)");
+    console.log("Azure Multi-Model Proxy v5.6 - Buffer text, suppress when tools present");
     console.log("=".repeat(60));
     console.log(`Server: 0.0.0.0:${CONFIG.PORT}`);
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
