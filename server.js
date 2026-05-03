@@ -5,24 +5,20 @@ const app = express();
 app.use(express.json({ limit: "50mb" }));
 
 const CONFIG = {
-    // Claude (Anthropic) on Azure
     AZURE_ENDPOINT: process.env.AZURE_ENDPOINT,
     AZURE_API_KEY: process.env.AZURE_API_KEY,
     AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
     ANTHROPIC_VERSION: "2023-06-01",
 
-    // GPT (OpenAI) on Azure
     AZURE_OPENAI_ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_API_KEY: process.env.AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_MODEL: process.env.AZURE_OPENAI_MODEL || "gpt-5.5",
     AZURE_OPENAI_DEPLOYMENT: process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || "gpt-5.5",
 
-    // Service auth
     SERVICE_API_KEY: process.env.SERVICE_API_KEY,
     PORT: process.env.PORT || 8080,
 };
 
-// Reasoning models reject custom temperature/top_p and need bigger output budgets
 const REASONING_MODEL_RX = /^(gpt-5|o1|o3|o4|codex)/i;
 function isReasoningModel(name) {
     return REASONING_MODEL_RX.test(String(name || ""));
@@ -87,7 +83,7 @@ function requireAuth(req, res, next) {
 }
 
 // ============================================================================
-// CLAUDE (Anthropic) TRANSFORMATIONS  -- unchanged
+// CLAUDE (Anthropic) TRANSFORMATIONS
 // ============================================================================
 
 function transformRequestForClaude(openAIRequest) {
@@ -343,7 +339,7 @@ function transformRequestForGPT(openAIRequest) {
     const gptRequest = {
         model: CONFIG.AZURE_OPENAI_MODEL,
         input: inputItems,
-        max_output_tokens: max_output_tokens || max_tokens || (reasoningModel ? 32768 : 16384),
+        max_output_tokens: max_output_tokens || max_tokens || (reasoningModel ? 65536 : 16384),
     };
 
     if (systemPrompt) {
@@ -351,7 +347,6 @@ function transformRequestForGPT(openAIRequest) {
         console.log("[GPT][TRANSFORM] System prompt -> instructions, length:", systemPrompt.length);
     }
 
-    // gpt-5.x / o-series reject custom temperature & top_p
     if (!reasoningModel) {
         if (temperature !== undefined) gptRequest.temperature = temperature;
         if (top_p !== undefined) gptRequest.top_p = top_p;
@@ -359,10 +354,9 @@ function transformRequestForGPT(openAIRequest) {
 
     if (stream !== undefined) gptRequest.stream = stream;
 
-    // Reasoning controls (medium effort + concise summary by default)
     if (reasoningModel) {
         gptRequest.reasoning = {
-            effort: reasoning?.effort || "medium",
+            effort: reasoning?.effort || "high",
             summary: reasoning?.summary || "auto",
         };
     }
@@ -465,7 +459,7 @@ app.get("/", (req, res) => {
     res.json({
         status: "running",
         name: "Azure Multi-Model Proxy (Claude + GPT)",
-        version: "5.2.0",
+        version: "5.3.0",
         endpoints: {
             health: "/health",
             chat_cursor: "/chat/completions",
@@ -591,6 +585,7 @@ function handleClaudeStreaming(req, res, response) {
     let buffer = "";
     const contentBlocks = {};
     let currentToolCallIndex = 0;
+    let doneSent = false;
 
     response.data.on("data", (chunk) => {
         buffer += chunk.toString();
@@ -600,7 +595,10 @@ function handleClaudeStreaming(req, res, response) {
         for (const line of lines) {
             if (!line.startsWith("data: ")) continue;
             const data = line.slice(6).trim();
-            if (data === "[DONE]") { res.write("data: [DONE]\n\n"); continue; }
+            if (data === "[DONE]") {
+                if (!doneSent) { doneSent = true; res.write("data: [DONE]\n\n"); }
+                continue;
+            }
 
             try {
                 const event = JSON.parse(data);
@@ -673,7 +671,7 @@ function handleClaudeStreaming(req, res, response) {
                         }],
                     };
                     res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
-                    res.write("data: [DONE]\n\n");
+                    if (!doneSent) { doneSent = true; res.write("data: [DONE]\n\n"); }
                 }
             } catch (e) {
                 console.error("[ERROR] Parse error:", e.message);
@@ -681,11 +679,37 @@ function handleClaudeStreaming(req, res, response) {
         }
     });
 
-    response.data.on("end", () => { console.log("[CLAUDE] Stream ended"); res.end(); });
+    response.data.on("end", () => {
+        console.log("[CLAUDE] Stream ended");
+        if (!doneSent) {
+            const stopChunk = {
+                id: "chatcmpl-" + Date.now(),
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: req.body.model || "claude-opus-4-5",
+                choices: [{ index: 0, delta: {}, finish_reason: currentToolCallIndex > 0 ? "tool_calls" : "stop" }],
+            };
+            res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
+            res.write("data: [DONE]\n\n");
+            doneSent = true;
+        }
+        res.end();
+    });
     response.data.on("error", (error) => {
         console.error("[ERROR] Stream error:", error.message);
-        if (!res.headersSent) res.status(500).json({ error: { message: "Stream error", type: "stream_error" } });
-        else res.end();
+        if (!doneSent) {
+            const stopChunk = {
+                id: "chatcmpl-" + Date.now(),
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: req.body.model || "claude-opus-4-5",
+                choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            };
+            res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
+            res.write("data: [DONE]\n\n");
+            doneSent = true;
+        }
+        res.end();
     });
 }
 
@@ -702,7 +726,6 @@ async function handleGPTRequest(req, res) {
     const isStreaming = req.body.stream === true;
     const endpoint = CONFIG.AZURE_OPENAI_ENDPOINT;
 
-    // Build the Responses-API-shaped body via our transformer (handles temperature stripping, reasoning, etc.)
     let forwardBody;
     try {
         forwardBody = transformRequestForGPT(req.body);
@@ -768,6 +791,7 @@ async function handleGPTRequest(req, res) {
             const toolMap = {};
             let hasTools = false;
             let roleSent = false;
+            let doneSent = false;
 
             function chatChunk(delta, finish) {
                 return JSON.stringify({
@@ -775,6 +799,17 @@ async function handleGPTRequest(req, res) {
                     model: CONFIG.AZURE_OPENAI_MODEL,
                     choices: [{ index: 0, delta, finish_reason: finish || null }]
                 });
+            }
+
+            function sendDone(self) {
+                if (doneSent) return;
+                doneSent = true;
+                if (!roleSent) {
+                    self.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
+                    roleSent = true;
+                }
+                self.push(`data: ${chatChunk({}, hasTools ? "tool_calls" : "stop")}\n\n`);
+                self.push("data: [DONE]\n\n");
             }
 
             const transformer = new Transform({
@@ -804,8 +839,7 @@ async function handleGPTRequest(req, res) {
                                 roleSent = true;
                             }
                             this.push(`data: ${chatChunk({ content: `[Azure API ${etype}: ${errDetail}]` })}\n\n`);
-                            this.push(`data: ${chatChunk({}, "stop")}\n\n`);
-                            this.push("data: [DONE]\n\n");
+                            sendDone(this);
                             continue;
                         }
 
@@ -821,13 +855,10 @@ async function handleGPTRequest(req, res) {
                             }
                             this.push(`data: ${chatChunk({ content: p.delta || "" })}\n\n`);
                         } else if (etype === "response.reasoning_summary_text.delta") {
-                            // Surface reasoning summaries as visible content so Plan/Ask see thinking
                             if (!roleSent) {
                                 this.push(`data: ${chatChunk({ role: "assistant", content: "" })}\n\n`);
                                 roleSent = true;
                             }
-                            // Optional: prefix with marker; comment out next line to hide reasoning
-                            // this.push(`data: ${chatChunk({ content: p.delta || "" })}\n\n`);
                         } else if (etype === "response.output_item.added" && (p.item?.type === "function_call" || p.item?.type === "custom_tool_call")) {
                             hasTools = true;
                             const callId = p.item.call_id || p.item.id;
@@ -848,18 +879,34 @@ async function handleGPTRequest(req, res) {
                                 tool_calls: [{ index: idx, function: { arguments: p.delta || "" } }]
                             })}\n\n`);
                         } else if (etype === "response.completed") {
-                            this.push(`data: ${chatChunk({}, hasTools ? "tool_calls" : "stop")}\n\n`);
-                            this.push("data: [DONE]\n\n");
+                            console.log("[GPT][COMPLETED]", requestId, "status:", p.response?.status);
+                            sendDone(this);
+                        } else if (etype === "response.incomplete") {
+                            const reason = p.response?.incomplete_details?.reason || "unknown";
+                            console.warn("[GPT][INCOMPLETE]", requestId, "reason:", reason);
+                            sendDone(this);
                         }
                     }
                     cb();
                 },
-                flush(cb) { cb(); }
+                flush(cb) {
+                    if (!doneSent) {
+                        console.warn("[GPT][FLUSH]", requestId, "Stream ended without response.completed — forcing [DONE]");
+                        sendDone(this);
+                    }
+                    cb();
+                }
             });
 
             response.data.pipe(transformer).pipe(res);
+
+            response.data.on("error", (err) => {
+                console.error("[GPT][STREAM-ERR]", requestId, err.message);
+                if (!doneSent) sendDone(transformer);
+                transformer.end();
+            });
+
         } else {
-            // Non-streaming: convert Responses API shape -> chat.completion shape
             res.json(transformGPTResponse(response.data));
         }
     } catch (error) {
@@ -913,7 +960,7 @@ app.use((req, res) => {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
-    console.log("Azure Multi-Model Proxy v5.2 - Claude + GPT-5.5 (Direct Pipe)");
+    console.log("Azure Multi-Model Proxy v5.3 - Claude + GPT (Loop-Fix)");
     console.log("=".repeat(60));
     console.log(`Server: 0.0.0.0:${CONFIG.PORT}`);
     console.log(`Claude: ${CONFIG.AZURE_API_KEY ? "Configured" : "MISSING"}`);
